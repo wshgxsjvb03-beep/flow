@@ -2,12 +2,14 @@
 from PyQt6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
                              QLabel, QLineEdit, QPushButton, QListWidget, 
                              QListWidgetItem, QSplitter, QFileDialog, QMessageBox,
-                             QInputDialog, QMenu, QToolTip, QDialog, QSpinBox)
-from PyQt6.QtCore import Qt, QSize
+                             QInputDialog, QMenu, QToolTip, QDialog, QSpinBox,
+                             QProgressBar, QFrame)
+from PyQt6.QtCore import Qt, QSize, QTimer
 from PyQt6.QtGui import QGuiApplication, QCursor, QColor
 from models.storage_manager import StorageManager
 from views.import_dialog import ImportDialog
 from views.project_detail_widget import ProjectDetailWidget
+from services.pipeline_scheduler import PipelineScheduler
 from pathlib import Path
 
 class RenameProjectDialog(QDialog):
@@ -113,13 +115,37 @@ class MainWindow(QMainWindow):
         # Initialize TemplateManager & ConfigManager
         from models.template_manager import TemplateManager
         from models.config_manager import ConfigManager
+        from services.plugin_server import PluginServer
         self.template_manager = TemplateManager(self.workspace_dir)
         self.config_manager = ConfigManager(self.workspace_dir)
         
+        # Initialize PluginServer
+        self.plugin_server = PluginServer(port=self.config_manager.plugin_server_port, parent=self)
+        if self.config_manager.enable_plugin_server:
+            self.plugin_server.start()
+        
         self.init_ui()
-        # Bind template & config manager to detail panel
+        # Bind template, config manager & plugin server to detail panel
         self.detail_widget.set_template_manager(self.template_manager)
         self.detail_widget.set_config_manager(self.config_manager)
+        self.detail_widget.set_plugin_server(self.plugin_server)
+        
+        self.plugin_server.client_connected_signal.connect(self.update_plugin_status_ui)
+        self.plugin_server.client_disconnected_signal.connect(self.update_plugin_status_ui)
+        self.plugin_server.client_updated_signal.connect(self.update_plugin_status_ui)
+        self.plugin_server.alarm_detected_signal.connect(self.on_plugin_alarm_detected)
+        self.update_plugin_status_ui()
+
+        # Initialize Global Multi-Project Pipeline Scheduler
+        self.pipeline_scheduler = PipelineScheduler(main_window=self, parent=self)
+        self.pipeline_scheduler.pipeline_started_signal.connect(self.on_pipeline_started)
+        self.pipeline_scheduler.pipeline_stopped_signal.connect(self.on_pipeline_stopped)
+        self.pipeline_scheduler.pipeline_finished_signal.connect(self.on_pipeline_finished)
+        self.pipeline_scheduler.project_switched_signal.connect(self.on_pipeline_project_switched)
+        self.pipeline_scheduler.project_completed_signal.connect(self.on_pipeline_project_completed)
+        self.pipeline_scheduler.points_exhausted_signal.connect(self.on_pipeline_points_exhausted)
+        self.pipeline_scheduler.progress_updated_signal.connect(self.on_pipeline_progress_updated)
+        
         self.load_initial_state()
 
     def init_ui(self):
@@ -257,6 +283,27 @@ class MainWindow(QMainWindow):
         self.btn_batch_check_video.clicked.connect(self.open_batch_video_check_dialog)
         top_layout.addWidget(self.btn_batch_check_video)
         
+        top_layout.addSpacing(8)
+        
+        self.btn_refresh_points = QPushButton("🔄 刷新点数")
+        self.btn_refresh_points.setObjectName("btn_refresh_points")
+        self.btn_refresh_points.setStyleSheet("""
+            QPushButton#btn_refresh_points {
+                background-color: #059669;
+                color: white;
+                font-size: 12px;
+                font-weight: bold;
+                padding: 4px 10px;
+                border-radius: 4px;
+            }
+            QPushButton#btn_refresh_points:hover {
+                background-color: #047857;
+            }
+        """)
+        self.btn_refresh_points.setToolTip("向所有已连接的浏览器插件发送指令，模拟点击头像以获取最新真实点数")
+        self.btn_refresh_points.clicked.connect(self.manual_refresh_plugin_points)
+        top_layout.addWidget(self.btn_refresh_points)
+        
         main_layout.addLayout(top_layout)
         
         # 2. Main Area (Splitter: Sidebar and Details)
@@ -268,7 +315,113 @@ class MainWindow(QMainWindow):
         sidebar_layout.setContentsMargins(0, 0, 0, 0)
         sidebar_layout.setSpacing(6)
         
-        sidebar_layout.addWidget(QLabel("项目列表 (Projects):"))
+        # Pipeline Header & Actions Box (带实时生成监控看板)
+        pipeline_box = QFrame()
+        pipeline_box.setStyleSheet("background-color: #EDE0D4; border-radius: 6px; padding: 6px;")
+        p_box_layout = QVBoxLayout(pipeline_box)
+        p_box_layout.setContentsMargins(6, 6, 6, 6)
+        p_box_layout.setSpacing(6)
+
+        hdr_row = QHBoxLayout()
+        hdr_row.addWidget(QLabel("<b>项目列表 (Projects)</b>"))
+        hdr_row.addStretch()
+        
+        self.btn_select_all_proj = QPushButton("☑️ 全选")
+        self.btn_select_all_proj.setStyleSheet("font-size: 11px; padding: 2px 6px;")
+        self.btn_select_all_proj.clicked.connect(self.select_all_projects_for_pipeline)
+        hdr_row.addWidget(self.btn_select_all_proj)
+
+        self.btn_clear_all_proj = QPushButton("⏹️ 清空")
+        self.btn_clear_all_proj.setStyleSheet("font-size: 11px; padding: 2px 6px;")
+        self.btn_clear_all_proj.clicked.connect(self.deselect_all_projects_for_pipeline)
+        hdr_row.addWidget(self.btn_clear_all_proj)
+        p_box_layout.addLayout(hdr_row)
+
+        self.btn_toggle_pipeline = QPushButton("🚀 启动全局无人值守流水线")
+        self.btn_toggle_pipeline.setObjectName("btn_toggle_pipeline")
+        self.btn_toggle_pipeline.setStyleSheet("""
+            QPushButton#btn_toggle_pipeline {
+                background-color: #059669;
+                color: white;
+                font-size: 12px;
+                font-weight: bold;
+                padding: 7px;
+                border-radius: 4px;
+            }
+            QPushButton#btn_toggle_pipeline:hover {
+                background-color: #047857;
+            }
+        """)
+        self.btn_toggle_pipeline.clicked.connect(self.toggle_global_pipeline)
+        p_box_layout.addWidget(self.btn_toggle_pipeline)
+
+        # 实时生成监控看板 (HUD)
+        self.pipeline_hud = QFrame()
+        self.pipeline_hud.setStyleSheet("""
+            QFrame {
+                background-color: #FFFFFF;
+                border: 1px solid #D7CCC8;
+                border-radius: 6px;
+                padding: 6px;
+            }
+            QProgressBar {
+                border: 1px solid #E2E8F0;
+                border-radius: 4px;
+                text-align: center;
+                font-size: 10px;
+                font-weight: bold;
+                color: #1E293B;
+                background-color: #F1F5F9;
+                height: 14px;
+            }
+            QProgressBar::chunk {
+                background-color: #10B981;
+                border-radius: 3px;
+            }
+        """)
+        hud_layout = QVBoxLayout(self.pipeline_hud)
+        hud_layout.setContentsMargins(6, 6, 6, 6)
+        hud_layout.setSpacing(4)
+
+        # 状态标题
+        self.lbl_pipeline_status = QLabel("就绪：勾选项目后点击启动")
+        self.lbl_pipeline_status.setStyleSheet("font-size: 11px; color: #4B5563; font-weight: bold; padding: 1px;")
+        hud_layout.addWidget(self.lbl_pipeline_status)
+
+        # 项目级进度条
+        self.lbl_proj_pbar_title = QLabel("📦 工程总进度: 0 / 0")
+        self.lbl_proj_pbar_title.setStyleSheet("font-size: 10px; color: #64748B; font-weight: normal;")
+        hud_layout.addWidget(self.lbl_proj_pbar_title)
+
+        self.pbar_projects = QProgressBar()
+        self.pbar_projects.setRange(0, 100)
+        self.pbar_projects.setValue(0)
+        hud_layout.addWidget(self.pbar_projects)
+
+        # 视频片段级进度条
+        self.lbl_video_pbar_title = QLabel("🎬 当前工程视频: 0 / 0")
+        self.lbl_video_pbar_title.setStyleSheet("font-size: 10px; color: #64748B; font-weight: normal;")
+        hud_layout.addWidget(self.lbl_video_pbar_title)
+
+        self.pbar_videos = QProgressBar()
+        self.pbar_videos.setRange(0, 100)
+        self.pbar_videos.setValue(0)
+        self.pbar_videos.setStyleSheet("""
+            QProgressBar::chunk {
+                background-color: #8B5CF6;
+            }
+        """)
+        hud_layout.addWidget(self.pbar_videos)
+
+        # 详细数据指标
+        self.lbl_pipeline_detail = QLabel("⚡ 在线 Worker: 0 | 剩余积分: 0")
+        self.lbl_pipeline_detail.setStyleSheet("font-size: 10px; color: #475569; padding-top: 2px;")
+        hud_layout.addWidget(self.lbl_pipeline_detail)
+
+        p_box_layout.addWidget(self.pipeline_hud)
+
+        sidebar_layout.addWidget(pipeline_box)
+
         self.list_projects = QListWidget()
         self.list_projects.itemClicked.connect(self.on_project_clicked)
         self.list_projects.itemDoubleClicked.connect(self.on_project_double_clicked)
@@ -342,7 +495,10 @@ class MainWindow(QMainWindow):
                 label += f" - {p['col7']}"
                 
             item = QListWidgetItem(label)
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            item.setCheckState(Qt.CheckState.Checked)
             item.setData(Qt.ItemDataRole.UserRole, p['path'])
+            item.setData(Qt.ItemDataRole.UserRole + 1, p)
             
             try:
                 proj_model = ProjectModel(p['path'])
@@ -537,6 +693,7 @@ class MainWindow(QMainWindow):
         thread.finished_signal.connect(
             lambda success, msg, pid=project_id: self.on_background_download_finished(success, msg, pid)
         )
+        thread.finished.connect(thread.deleteLater)
         
         thread.start()
 
@@ -586,9 +743,8 @@ class MainWindow(QMainWindow):
             # 1. Stop any active download thread first
             if project_id in self.active_downloads:
                 thread = self.active_downloads.pop(project_id)
-                if thread.isRunning():
-                    thread.terminate()
-                    thread.wait()
+                if thread and thread.isRunning():
+                    thread.stop()
             
             # 2. Delete the directory recursively
             import shutil
@@ -621,12 +777,6 @@ class MainWindow(QMainWindow):
             if self.detail_widget.project_model:
                 self.detail_widget.refresh_template_comboboxes()
 
-    def open_settings_dialog(self):
-        """Opens the global rule settings dialog."""
-        from views.settings_dialog import SettingsDialog
-        dialog = SettingsDialog(self.config_manager, self)
-        dialog.exec()
-
     def open_batch_video_check_dialog(self):
         """Opens batch video completeness dialog for all projects in storage_manager."""
         projects = self.storage_manager.list_projects()
@@ -638,4 +788,226 @@ class MainWindow(QMainWindow):
         from views.video_check_dialog import BatchVideoCheckDialog
         dialog = BatchVideoCheckDialog(projects, base_storage_path, self)
         dialog.exec()
+
+    def update_plugin_status_ui(self, info=None):
+        """Updates the plugin connection status."""
+        if hasattr(self, "lbl_plugin_status"):
+            if not hasattr(self, "plugin_server") or not self.plugin_server:
+                self.lbl_plugin_status.setText("🔌 插件未连接")
+                self.lbl_plugin_status.setStyleSheet("color: #64748B; font-size: 12px; font-weight: bold; padding: 4px 8px; border: 1px solid #CBD5E1; border-radius: 4px; background-color: #F8FAFC;")
+                return
+                
+            clients = self.plugin_server.get_online_clients()
+            count = len(clients)
+            if count == 0:
+                self.lbl_plugin_status.setText("🔴 插件未连接 (ws://127.0.0.1:18188)")
+                self.lbl_plugin_status.setStyleSheet("color: #DC2626; font-size: 12px; font-weight: bold; padding: 4px 8px; border: 1px solid #FCA5A5; border-radius: 4px; background-color: #FEF2F2;")
+            else:
+                pts_summary = ", ".join(f"{(c.get('email') or c.get('client_id', '')).split('@')[0]}:{c.get('remaining_points', 0)}分" for c in clients[:3])
+                if len(clients) > 3:
+                    pts_summary += "..."
+                text = f"🟢 插件在线: {count} 个 ({pts_summary})"
+                self.lbl_plugin_status.setText(text)
+                self.lbl_plugin_status.setStyleSheet("color: #059669; font-size: 12px; font-weight: bold; padding: 4px 8px; border: 1px solid #A7F3D0; border-radius: 4px; background-color: #ECFDF5;")
+
+    def manual_refresh_plugin_points(self):
+        """Broadcasts get_points RPC request to all connected browsers to probe points."""
+        if not hasattr(self, "plugin_server") or not self.plugin_server:
+            QMessageBox.warning(self, "提示", "插件服务未启动。")
+            return
+
+        clients = self.plugin_server.get_online_clients()
+        if not clients:
+            QMessageBox.information(self, "提示", "当前没有在线的浏览器插件。请先打开 Google Flow 网页。")
+            return
+
+        sent_count = self.plugin_server.query_all_clients_points()
+        if hasattr(self, "lbl_plugin_status"):
+            self.lbl_plugin_status.setText("⏳ 正在探测各浏览器最新点数...")
+            self.lbl_plugin_status.setStyleSheet("color: #D97706; font-size: 12px; font-weight: bold; padding: 4px 8px; border: 1px solid #FCD34D; border-radius: 4px; background-color: #FEF3C7;")
+            QTimer.singleShot(2500, self.update_plugin_status_ui)
+        else:
+            self.statusBar().showMessage(f"已向 {sent_count} 个浏览器发送探测点数指令...", 3000)
+
+    def on_plugin_alarm_detected(self, alarm_info):
+        """Handles safety / unusual activity limit notification from Google Flow plugin."""
+        client_id = alarm_info.get("client_id", "")
+        msg = alarm_info.get("message", "检测到 Google 安全限制（异常活动）")
+        if hasattr(self, "lbl_plugin_status"):
+            self.lbl_plugin_status.setText(f"🚨 {client_id} 安全风控挂起")
+            self.lbl_plugin_status.setStyleSheet("color: #DC2626; font-size: 12px; font-weight: bold; padding: 4px 8px; border: 1px solid #DC2626; border-radius: 4px; background-color: #FEE2E2;")
+        QMessageBox.warning(
+            self, "Google 安全限制警报",
+            f"收到浏览器 Worker 【{client_id}】的告警：\n\n{msg}\n\n"
+            "建议：请切到该浏览器窗口查看并手动消除网页安全验证，或等待插件自动刷新重试。"
+        )
+
+    def select_all_projects_for_pipeline(self):
+        """Checks all project items in sidebar list."""
+        for i in range(self.list_projects.count()):
+            item = self.list_projects.item(i)
+            item.setCheckState(Qt.CheckState.Checked)
+
+    def deselect_all_projects_for_pipeline(self):
+        """Unchecks all project items in sidebar list."""
+        for i in range(self.list_projects.count()):
+            item = self.list_projects.item(i)
+            item.setCheckState(Qt.CheckState.Unchecked)
+
+    def toggle_global_pipeline(self):
+        """Starts or stops the multi-project automated pipeline."""
+        if self.pipeline_scheduler.is_running:
+            self.pipeline_scheduler.stop()
+            return
+
+        # Gather checked projects from sidebar list
+        checked_projects = []
+        for i in range(self.list_projects.count()):
+            item = self.list_projects.item(i)
+            if item.checkState() == Qt.CheckState.Checked:
+                p_data = item.data(Qt.ItemDataRole.UserRole + 1)
+                if p_data:
+                    checked_projects.append(p_data)
+
+        if not checked_projects:
+            QMessageBox.warning(self, "提示", "请先在项目列表中勾选至少一个要生成的项目！")
+            return
+
+        clients = self.plugin_server.get_online_clients() if self.plugin_server else []
+        if not clients:
+            QMessageBox.warning(self, "提示", "当前没有在线的浏览器 Worker。请先打开 Google Flow 网页。")
+            return
+
+        self.pipeline_scheduler.set_queue(checked_projects)
+        self.pipeline_scheduler.start()
+
+    def on_pipeline_started(self, total_count):
+        """UI updates when global pipeline starts."""
+        self.btn_toggle_pipeline.setText("⏸️ 暂停全局流水线")
+        self.btn_toggle_pipeline.setStyleSheet("""
+            QPushButton#btn_toggle_pipeline {
+                background-color: #DC2626;
+                color: white;
+                font-size: 12px;
+                font-weight: bold;
+                padding: 7px;
+                border-radius: 4px;
+            }
+            QPushButton#btn_toggle_pipeline:hover {
+                background-color: #B91C1C;
+            }
+        """)
+        self.lbl_pipeline_status.setText(f"🚀 流水线启动，共排队 {total_count} 个工程")
+        self.lbl_pipeline_status.setStyleSheet("font-size: 11px; color: #059669; font-weight: bold; padding: 1px;")
+        self.pbar_projects.setMaximum(max(1, total_count))
+        self.pbar_projects.setValue(0)
+        self.lbl_proj_pbar_title.setText(f"📦 全局工程: 0 / {total_count}")
+
+    def on_pipeline_stopped(self):
+        """UI updates when global pipeline stops."""
+        self.btn_toggle_pipeline.setText("🚀 启动全局无人值守流水线")
+        self.btn_toggle_pipeline.setStyleSheet("""
+            QPushButton#btn_toggle_pipeline {
+                background-color: #059669;
+                color: white;
+                font-size: 12px;
+                font-weight: bold;
+                padding: 7px;
+                border-radius: 4px;
+            }
+            QPushButton#btn_toggle_pipeline:hover {
+                background-color: #047857;
+            }
+        """)
+        self.lbl_pipeline_status.setText("⏸️ 流水线已暂停")
+        self.lbl_pipeline_status.setStyleSheet("font-size: 11px; color: #DC2626; font-weight: bold; padding: 1px;")
+        self.setWindowTitle("项目管理器 (Project Manager)")
+
+    def on_pipeline_project_switched(self, proj_name, current_idx, total_count):
+        """UI updates when pipeline advances to next project."""
+        self.lbl_pipeline_status.setText(f"⚡ 正在生成 [{current_idx}/{total_count}]: {proj_name}")
+        self.lbl_pipeline_status.setStyleSheet("font-size: 11px; color: #2563EB; font-weight: bold; padding: 1px;")
+        self.lbl_proj_pbar_title.setText(f"📦 全局工程: 第 {current_idx}/{total_count} 个")
+        self.pbar_projects.setValue(current_idx - 1)
+
+    def on_pipeline_progress_updated(self, proj_name, cur_proj_idx, total_projs, completed_vids, total_vids, pool_pts):
+        """Real-time UI update callback when video progress changes."""
+        # 1. Update project-level progress bar
+        proj_pct = int(cur_proj_idx / max(1, total_projs) * 100)
+        self.lbl_proj_pbar_title.setText(f"📦 全局工程: 第 {cur_proj_idx}/{total_projs} 个 ({proj_pct}%)")
+        self.pbar_projects.setMaximum(max(1, total_projs))
+        self.pbar_projects.setValue(cur_proj_idx)
+
+        # 2. Update video-level progress bar
+        vid_pct = int(completed_vids / max(1, total_vids) * 100) if total_vids > 0 else 0
+        self.lbl_video_pbar_title.setText(f"🎬 当前工程视频: 第 {completed_vids}/{total_vids} 个 ({vid_pct}%)")
+        self.pbar_videos.setMaximum(max(1, total_vids))
+        self.pbar_videos.setValue(completed_vids)
+
+        # 3. Update main status label
+        self.lbl_pipeline_status.setText(f"⚡ 正在生成 [{cur_proj_idx}/{total_projs}]: {proj_name}")
+        self.lbl_pipeline_status.setStyleSheet("font-size: 11px; color: #2563EB; font-weight: bold; padding: 1px;")
+
+        # 4. Update online workers & points info
+        workers_count = len(self.plugin_server.get_online_clients()) if self.plugin_server else 0
+        self.lbl_pipeline_detail.setText(f"🌐 Worker: {workers_count} 在线 | ⚡ 剩余积分: {pool_pts} pts")
+
+        # 5. Update window title
+        self.setWindowTitle(f"项目管理器 - [全局生成 {cur_proj_idx}/{total_projs} 工程 | 视频 {completed_vids}/{total_vids}]")
+
+    def on_pipeline_project_completed(self, proj_name, project_idx):
+        """UI updates when a project in queue is 100% finished."""
+        self.reload_projects_list()
+
+    def on_pipeline_finished(self, completed_count, total_count):
+        """UI notification when entire queue completes."""
+        self.on_pipeline_stopped()
+        self.reload_projects_list()
+        self.pbar_projects.setValue(total_count)
+        self.pbar_videos.setValue(self.pbar_videos.maximum())
+        self.lbl_proj_pbar_title.setText(f"📦 全局工程: {completed_count}/{total_count} 全部完成 (100%)")
+        self.lbl_video_pbar_title.setText("🎬 所有视频已全部就绪 (100%)")
+        self.lbl_pipeline_status.setText(f"🎉 全部完成！共成功跑完 {completed_count}/{total_count} 个工程")
+        self.lbl_pipeline_status.setStyleSheet("font-size: 11px; color: #059669; font-weight: bold; padding: 1px;")
+        QMessageBox.information(self, "流水线全部完成", f"🎉 恭喜！排队的 {completed_count} 个工程已全部 100% 生成并自动标绿归档！")
+
+    def on_pipeline_points_exhausted(self, total_pts):
+        """UI notification when all workers run out of credits."""
+        self.on_pipeline_stopped()
+        QMessageBox.warning(
+            self, "浏览器点数已榨干",
+            f"⚠️ 所有在线浏览器的可用点数已全部消耗完毕 (总点数剩余 {total_pts} 点，不足以支付下一个片段)。\n\n"
+            "全局流水线已安全挂起并自动保存所有已完成的工程。"
+        )
+
+    def select_project_by_info(self, proj_info):
+        """Selects and opens project in UI given its info dict."""
+        target_path = proj_info.get("path") if isinstance(proj_info, dict) else str(proj_info)
+        for i in range(self.list_projects.count()):
+            item = self.list_projects.item(i)
+            if item.data(Qt.ItemDataRole.UserRole) == target_path:
+                self.list_projects.setCurrentItem(item)
+                self.detail_widget.set_project(target_path)
+                break
+
+    def closeEvent(self, event):
+        """Clean up background tasks, plugin server, and media players before quitting."""
+        if hasattr(self, "plugin_server") and self.plugin_server:
+            try:
+                self.plugin_server.stop()
+            except Exception:
+                pass
+                
+        if hasattr(self, "active_downloads"):
+            for project_id, thread in list(self.active_downloads.items()):
+                if thread and thread.isRunning():
+                    thread.stop()
+            self.active_downloads.clear()
+            
+        if hasattr(self, "detail_widget") and self.detail_widget:
+            if hasattr(self.detail_widget, "cleanup"):
+                self.detail_widget.cleanup()
+                
+        super().closeEvent(event)
+
 

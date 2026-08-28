@@ -11,6 +11,8 @@ class SettingsDialog(QDialog):
     def __init__(self, config_manager, parent=None):
         super().__init__(parent)
         self.cm = config_manager
+        if self.cm:
+            self.cm.load()
         self.init_ui()
         self.load_data()
 
@@ -321,6 +323,11 @@ class SettingsDialog(QDialog):
             self.load_data()
 
     def save_settings(self):
+        # Commit any in-progress cell editor in tables
+        self.table_char_dur.clearFocus()
+        self.table_dur_pts.clearFocus()
+        self.setFocus()
+        
         # Read max batch points & forced split marker
         self.cm.max_batch_points = self.spin_max_points.value()
         self.cm.forced_split_marker = self.txt_marker.text().strip() or "///"

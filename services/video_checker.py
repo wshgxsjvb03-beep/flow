@@ -356,3 +356,96 @@ class VideoChecker:
             "already_count": total_already,
             "errors": all_errors
         }
+
+    @staticmethod
+    def delete_segment_video_files(project_model, project_path, segment_indices, base_storage_path=None):
+        """Deletes video files on disk for specific segment indices and resets their metadata."""
+        if not project_model or not project_path or not segment_indices:
+            return {"deleted_count": 0, "errors": []}
+
+        project_path_obj = Path(project_path)
+        post_relocate_dir = project_path_obj / "downloads" / "videos"
+        
+        # Determine pre-relocate search directories
+        pre_relocate_search_dirs = []
+        if not base_storage_path:
+            base_storage_path = project_path_obj.parent
+        else:
+            base_storage_path = Path(base_storage_path)
+
+        flow_base = base_storage_path / "Flow"
+        if flow_base.exists() and flow_base.is_dir():
+            project_id = getattr(project_model, "project_id", project_path_obj.name)
+            index = getattr(project_model, "index", 1)
+            col1_name = getattr(project_model, "col1_name", "")
+            matched_subfolders = VideoChecker.find_project_folders(flow_base, project_id, index, col1_name)
+            for sf in matched_subfolders:
+                pre_relocate_search_dirs.append(sf)
+            direct_proj_flow = flow_base / project_id
+            if direct_proj_flow.exists() and direct_proj_flow.is_dir():
+                if direct_proj_flow.resolve() not in [p.resolve() for p in pre_relocate_search_dirs]:
+                    pre_relocate_search_dirs.append(direct_proj_flow)
+            if not pre_relocate_search_dirs:
+                pre_relocate_search_dirs.append(flow_base)
+
+        deleted_files_count = 0
+        error_msgs = []
+        segments = project_model.spanish_segments if project_model else []
+
+        for idx in segment_indices:
+            if idx < 0 or idx >= len(segments):
+                continue
+            
+            seq_num = idx + 1
+            files_to_delete = set()
+
+            # 1. Look in post-relocate directory
+            if post_relocate_dir.exists():
+                try:
+                    for entry in post_relocate_dir.iterdir():
+                        if entry.is_file() and VideoChecker.is_matching_video_file(entry.name, seq_num):
+                            files_to_delete.add(entry)
+                except Exception as e:
+                    error_msgs.append(f"扫描目录 {post_relocate_dir} 失败: {e}")
+
+            # 2. Look in pre-relocate directories
+            for p_dir in pre_relocate_search_dirs:
+                if p_dir.exists() and p_dir.is_dir():
+                    try:
+                        for entry in p_dir.iterdir():
+                            if entry.is_file() and VideoChecker.is_matching_video_file(entry.name, seq_num):
+                                files_to_delete.add(entry)
+                    except Exception as e:
+                        error_msgs.append(f"扫描目录 {p_dir} 失败: {e}")
+
+            # 3. Delete files
+            for file_path in files_to_delete:
+                try:
+                    if file_path.exists():
+                        file_path.unlink()
+                        deleted_files_count += 1
+                except Exception as e:
+                    error_msgs.append(f"删除文件 {file_path.name} 失败: {e}")
+
+            # 4. Reset segment metadata
+            seg = segments[idx]
+            seg["marked_for_deletion"] = False
+            seg["checked"] = False
+            seg["auto_checked"] = False
+            seg["mismatch_flagged"] = False
+            seg["extracted_text"] = ""
+            seg["similarity_score"] = 0
+            seg["extraction_engine"] = ""
+            seg["copied"] = False
+            seg["completed"] = False
+
+        try:
+            project_model.save()
+        except Exception as e:
+            error_msgs.append(f"保存元数据失败: {e}")
+
+        return {
+            "deleted_count": deleted_files_count,
+            "errors": error_msgs
+        }
+

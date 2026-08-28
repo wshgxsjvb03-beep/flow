@@ -3,13 +3,16 @@ import os
 import re
 import subprocess
 import sys
+import logging
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, 
                              QPushButton, QTextEdit, QTableWidget, QTableWidgetItem, 
                              QHeaderView, QTabWidget, QListWidget, QListWidgetItem, 
                              QMessageBox, QSplitter, QLineEdit, QAbstractItemView, 
                              QToolTip, QComboBox, QFrame, QDialog)
-from PyQt6.QtCore import Qt, pyqtSlot, QUrl
+from PyQt6.QtCore import Qt, pyqtSlot, QUrl, QTimer, QDateTime
 from PyQt6.QtGui import QDesktopServices, QGuiApplication, QCursor, QPixmap
 from models.project_model import ProjectModel
 from services.text_processor import TextProcessor
@@ -27,7 +30,12 @@ class ProjectDetailWidget(QWidget):
         self.download_thread = None
         self.template_manager = None
         self.config_manager = None
+        self.plugin_server = None
         self.copied_rows = set()
+        self.dispatched_indices = set()
+        self.is_auto_polling_active = False
+        self.polling_timer = None
+        self.active_batch_dialog = None
         self.init_ui()
 
     def set_template_manager(self, tm):
@@ -35,6 +43,18 @@ class ProjectDetailWidget(QWidget):
 
     def set_config_manager(self, cm):
         self.config_manager = cm
+
+    def set_plugin_server(self, ps):
+        self.plugin_server = ps
+        if self.plugin_server:
+            self.plugin_server.report_received_signal.connect(self.on_plugin_report_received)
+            self.plugin_server.client_connected_signal.connect(self.on_plugin_clients_changed)
+            self.plugin_server.client_disconnected_signal.connect(self.on_plugin_clients_changed)
+            self.plugin_server.client_updated_signal.connect(self.on_plugin_clients_changed)
+
+    def on_plugin_clients_changed(self, info=None):
+        if self.active_batch_dialog and self.active_batch_dialog.isVisible():
+            self.active_batch_dialog.refresh_workers_list()
 
     def init_ui(self):
         # Base styling for warm theme
@@ -159,10 +179,36 @@ class ProjectDetailWidget(QWidget):
         self.init_text_tab()
         self.init_media_tab()
         self.init_compare_tab()
+        self.tabs.currentChanged.connect(self._on_tab_changed)
         self.content_layout.addWidget(self.tabs)
         
         self.layout_stack.addWidget(self.content_widget)
         self.content_widget.setVisible(False)
+
+    def _on_tab_changed(self, index):
+        """Pauses media playback if switching away from video compare tab."""
+        if hasattr(self, 'video_compare_widget') and self.video_compare_widget:
+            compare_index = self.tabs.indexOf(self.video_compare_widget)
+            if compare_index != -1 and index != compare_index:
+                if hasattr(self.video_compare_widget, 'media_player') and self.video_compare_widget.media_player:
+                    try:
+                        self.video_compare_widget.media_player.pause()
+                    except Exception:
+                        pass
+
+    def cleanup(self):
+        """Cleans up active download threads and video compare widget resources."""
+        if hasattr(self, 'download_thread') and self.download_thread:
+            try:
+                if self.download_thread.isRunning():
+                    self.download_thread.stop()
+            except Exception:
+                pass
+            self.download_thread = None
+            
+        if hasattr(self, 'video_compare_widget') and self.video_compare_widget:
+            if hasattr(self.video_compare_widget, 'cleanup'):
+                self.video_compare_widget.cleanup()
 
     def init_text_tab(self):
         tab_widget = QWidget()
@@ -450,6 +496,7 @@ class ProjectDetailWidget(QWidget):
 
     def reset_to_no_selection(self):
         """Resets the detail widget to the 'No Selection' state."""
+        self.cleanup()
         self.project_path = None
         self.project_model = None
         self.content_widget.setVisible(False)
@@ -462,6 +509,7 @@ class ProjectDetailWidget(QWidget):
         """Initializes the video vs script comparison tab (Tab 3)."""
         from views.video_compare_widget import VideoCompareWidget
         self.video_compare_widget = VideoCompareWidget()
+        self.video_compare_widget.videos_deleted.connect(self.populate_segments_table)
         self.tabs.addTab(self.video_compare_widget, "🎬 视频与文案比对")
 
     def set_project(self, project_path):
@@ -469,6 +517,9 @@ class ProjectDetailWidget(QWidget):
         self.project_path = Path(project_path)
         self.project_model = ProjectModel(self.project_path)
         self.copied_rows = set()
+        self.dispatched_indices = set()
+        self.failed_skip_indices = set()
+        self.segment_retry_counts = {}
         
         # Switch visible UI
         self.no_selection_widget.setVisible(False)
@@ -515,14 +566,12 @@ class ProjectDetailWidget(QWidget):
         segments = self.project_model.spanish_segments
         self.table_segments.setRowCount(len(segments))
         
-        # Auto-associate single downloaded image if applicable
-        single_img = self.get_project_single_image()
-        if single_img:
-            for seg in segments:
-                if not seg.get("image_name"):
-                    seg["image_name"] = single_img
-        
         for idx, seg in enumerate(segments):
+            # 智能解析关联图片素材
+            img_name, _, _ = self.resolve_segment_image_and_data(idx, seg)
+            if img_name:
+                seg["image_name"] = img_name
+
             # 0. Index & Icons (📷: has image, ⚙️: has custom template/motion)
             has_image = bool(seg.get("image_name"))
             has_custom = bool(seg.get("template_id")) or bool(seg.get("motion_id"))
@@ -545,17 +594,25 @@ class ProjectDetailWidget(QWidget):
             # Determine duration label
             if self.config_manager:
                 duration_label = self.config_manager.get_duration_label(length)
+                duration_val = self.config_manager.get_duration_for_length(length)
             else:
-                if length <= 50:
+                if length <= 40:
                     duration_label = "4s"
-                elif length <= 100:
+                    duration_val = 4
+                elif length <= 90:
                     duration_label = "6s"
-                elif length <= 140:
+                    duration_val = 6
+                elif length <= 130:
                     duration_label = "8s"
-                elif length <= 180:
+                    duration_val = 8
+                elif length <= 170:
                     duration_label = "10s"
+                    duration_val = 10
                 else:
                     duration_label = "超时 (>10s)"
+                    duration_val = 10
+                    
+            seg["duration"] = duration_val
                 
             # 2. Length (read-only)
             self.table_segments.setItem(idx, 2, QTableWidgetItem(str(length)))
@@ -596,17 +653,23 @@ class ProjectDetailWidget(QWidget):
             
             self.table_segments.setCellWidget(idx, 5, btn_widget)
             
-        # Apply colors for copied rows
+        # Apply colors for rows based on whether local video exists on disk
         if not hasattr(self, 'copied_rows'):
             self.copied_rows = set()
+        self.copied_rows.clear()
             
+        videos_dir = self.project_path / "downloads" / "videos" if self.project_path else Path("downloads/videos")
         for idx, seg in enumerate(segments):
-            if seg.get("copied"):
+            vid_file = (videos_dir / f"{idx+1:02d}.mp4").resolve()
+            if vid_file.exists() and vid_file.stat().st_size > 0:
+                seg["copied"] = True
+                seg["completed"] = True
                 self.copied_rows.add(idx)
-                
-        for r in list(self.copied_rows):
-            if r < len(segments):
-                self.change_row_color(r, copied=True)
+                self.change_row_color(idx, copied=True)
+            else:
+                seg["copied"] = False
+                seg["completed"] = False
+                self.change_row_color(idx, copied=False)
             
         self.table_segments.blockSignals(False)
         self.filter_segments_table()
@@ -651,16 +714,16 @@ class ProjectDetailWidget(QWidget):
             duration_label = self.config_manager.get_duration_label(length)
             duration_val = self.config_manager.get_duration_for_length(length)
         else:
-            if length <= 50:
+            if length <= 40:
                 duration_label = "4s"
                 duration_val = 4
-            elif length <= 100:
+            elif length <= 90:
                 duration_label = "6s"
                 duration_val = 6
-            elif length <= 140:
+            elif length <= 130:
                 duration_label = "8s"
                 duration_val = 8
-            elif length <= 180:
+            elif length <= 170:
                 duration_label = "10s"
                 duration_val = 10
             else:
@@ -679,7 +742,8 @@ class ProjectDetailWidget(QWidget):
         # 2. Update duration cell
         dur_item = QTableWidgetItem(duration_label)
         dur_item.setFlags(Qt.ItemFlag.ItemIsEnabled)
-        if length > 180:
+        max_limit = self.config_manager.get_max_chars() if self.config_manager else 170
+        if length > max_limit:
             dur_item.setForeground(Qt.GlobalColor.red)
         self.table_segments.setItem(row, 3, dur_item)
         
@@ -857,6 +921,22 @@ class ProjectDetailWidget(QWidget):
                     item.setData(Qt.ItemDataRole.BackgroundRole, None)
                     item.setData(Qt.ItemDataRole.ForegroundRole, None)
 
+    def reset_all_segments_completed_state(self):
+        """Resets all segments in the current project from completed/green back to uncompleted."""
+        if hasattr(self, 'copied_rows'):
+            self.copied_rows.clear()
+        if hasattr(self, 'dispatched_indices'):
+            self.dispatched_indices.clear()
+
+        if self.project_model and self.project_model.spanish_segments:
+            for seg in self.project_model.spanish_segments:
+                seg["copied"] = False
+                seg["completed"] = False
+            self.project_model.save()
+
+        self.populate_segments_table()
+        QMessageBox.information(self, "重置完成", "✅ 已成功重置所有分句为【未完成状态】！\n\n再次点击分发时，所有浏览器将全量并发重新开刷。")
+
     def delete_selected_segment(self):
         """Deletes selected row in segments table."""
         selected_rows = self.table_segments.selectedRanges()
@@ -984,9 +1064,17 @@ class ProjectDetailWidget(QWidget):
             downloads_dir = self.project_path / "downloads"
             self.btn_download.setEnabled(False)
             self.lbl_download_status.setText("下载状态: 初始化中...")
+            if hasattr(self, "download_thread") and self.download_thread:
+                try:
+                    if self.download_thread.isRunning():
+                        self.download_thread.stop()
+                except Exception:
+                    pass
+                self.download_thread = None
             self.download_thread = DownloadThread(url, downloads_dir)
             self.download_thread.status_signal.connect(self.on_download_status_updated)
             self.download_thread.finished_signal.connect(self.on_download_finished)
+            self.download_thread.finished_signal.connect(self.download_thread.deleteLater)
             self.download_thread.start()
 
     def on_download_status_updated(self, msg):
@@ -1295,6 +1383,90 @@ class ProjectDetailWidget(QWidget):
         
         # Disable properties by default until a row is selected
         self.property_panel.setEnabled(False)
+
+    def resolve_segment_image_and_data(self, idx, seg):
+        """
+        智能解析分句关联的图片文件名、绝对路径以及 Base64 Data URL：
+        1. 优先检查 seg 中显式绑定的 image_name 是否真实存在于 downloads/；
+        2. 按分句序号智能精准匹配 downloads/ 下的文件（如 01.png, 01.jpg, 1.png, 1.jpg, 01_*.png 等）；
+        3. 若工程内仅有 1 张图片，所有分句自动共用该图片；
+        4. 若工程内有多张图片，按文件名升序排序后，自动关联第 idx 张；
+        5. 若图片数量少于分句数，循环取模取用或使用首张；
+        6. 自动将图片文件读取并编码为 base64 data url (如 data:image/png;base64,xxxx)，确保浏览器能 100% 自动上传！
+        """
+        if not self.project_path:
+            return "", "", ""
+
+        downloads_dir = self.project_path / "downloads"
+        if not downloads_dir.exists():
+            return "", "", ""
+
+        img_extensions = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"}
+        try:
+            all_imgs = [item for item in downloads_dir.iterdir() if item.is_file() and item.suffix.lower() in img_extensions]
+            all_imgs.sort(key=lambda x: x.name)
+        except Exception:
+            return "", "", ""
+
+        if not all_imgs:
+            return "", "", ""
+
+        chosen_img_obj = None
+
+        # 1. 优先检查 seg 中的显式绑定
+        explicit_name = seg.get("image_name", "").strip() if isinstance(seg, dict) else ""
+        if explicit_name:
+            cand = downloads_dir / explicit_name
+            if cand.exists() and cand.is_file():
+                chosen_img_obj = cand
+
+        # 2. 按序号匹配 (1.jpg, 01.jpg, 1_*.jpg 等)
+        if not chosen_img_obj:
+            idx_str1 = f"{idx + 1}"
+            idx_str2 = f"{idx + 1:02d}"
+            for img in all_imgs:
+                stem = img.stem
+                if stem == idx_str1 or stem == idx_str2 or stem.startswith(f"{idx_str1}_") or stem.startswith(f"{idx_str2}_") or stem.startswith(f"{idx_str1}-") or stem.startswith(f"{idx_str2}-"):
+                    chosen_img_obj = img
+                    break
+
+        # 3. 若只有 1 张图片，全工程共用
+        if not chosen_img_obj and len(all_imgs) == 1:
+            chosen_img_obj = all_imgs[0]
+
+        # 4. 若有多张图片，按顺序对齐第 idx 张（若超出则取模或首张）
+        if not chosen_img_obj:
+            if idx < len(all_imgs):
+                chosen_img_obj = all_imgs[idx]
+            else:
+                chosen_img_obj = all_imgs[idx % len(all_imgs)]
+
+        if not chosen_img_obj or not chosen_img_obj.exists():
+            return "", "", ""
+
+        chosen_name = chosen_img_obj.name
+        chosen_path = str(chosen_img_obj.resolve())
+
+        # 5. 编码为 Base64 Data URL
+        import base64
+        import mimetypes
+        mime_type, _ = mimetypes.guess_type(chosen_path)
+        if not mime_type:
+            mime_type = "image/png"
+
+        data_url = ""
+        try:
+            with open(chosen_img_obj, "rb") as f:
+                b64_str = base64.b64encode(f.read()).decode("utf-8")
+                data_url = f"data:{mime_type};base64,{b64_str}"
+        except Exception as e:
+            logger.warning(f"读取图片 Base64 失败 [{chosen_name}]: {e}")
+
+        # 同步回写进 seg 中
+        if isinstance(seg, dict):
+            seg["image_name"] = chosen_name
+
+        return chosen_name, chosen_path, data_url
 
     def get_project_single_image(self):
         """Returns the filename of the single image in downloads directory, or None if 0 or >1 images."""
@@ -1688,12 +1860,24 @@ class ProjectDetailWidget(QWidget):
         all_tasks = []
         skipped_copied_count = 0
         
+        videos_dir = self.project_path / "downloads" / "videos" if self.project_path else Path("downloads/videos")
         for idx, seg in enumerate(segments):
-            # Exclude segments that have already been manually copied/generated (indicated by green state)
-            is_copied = seg.get("copied", False) or (hasattr(self, 'copied_rows') and idx in self.copied_rows)
-            if is_copied:
+            # 严格依据本地磁盘是否存在已完成的 mp4 视频文件作为跳过标准
+            download_name = f"{idx+1:02d}.mp4"
+            download_path_obj = (videos_dir / download_name).resolve()
+            
+            if download_path_obj.exists() and download_path_obj.stat().st_size > 0:
+                seg["copied"] = True
+                seg["completed"] = True
+                if hasattr(self, 'copied_rows'):
+                    self.copied_rows.add(idx)
                 skipped_copied_count += 1
                 continue
+            else:
+                seg["copied"] = False
+                seg["completed"] = False
+                if hasattr(self, 'copied_rows'):
+                    self.copied_rows.discard(idx)
                 
             raw_text = seg.get("text", "")
             text = TextProcessor.remove_punctuation(raw_text)
@@ -1969,19 +2153,433 @@ class ProjectDetailWidget(QWidget):
         else:
             QMessageBox.warning(self, "未找到文件", msg)
 
+    def on_plugin_report_received(self, report_data):
+        """Processes execution report received via WebSocket from a browser plugin."""
+        if not self.project_model:
+            return
+            
+        data = report_data.get("data", [])
+        segments = self.project_model.spanish_segments
+        chrome_downloads = Path.home() / "Downloads"
+        import base64
+        import shutil
+
+        updated_count = 0
+        for item in data:
+            idx = item.get("index")
+            status = item.get("status", "success")
+            download_url = item.get("download_url")
+            target_path_str = item.get("download_path")
+            base64_data = item.get("base64Data") or item.get("base64_data")
+
+            # 兼容通过 prompt 反查 index
+            if (idx is None or not isinstance(idx, int) or idx < 0 or idx >= len(segments)) and item.get("prompt"):
+                for s_idx, seg in enumerate(segments):
+                    if item.get("prompt") in seg.get("text", ""):
+                        idx = s_idx
+                        break
+
+            # 兼容 1-indexed 索引 (例如 1..len(segments))
+            if idx is not None and isinstance(idx, int):
+                if idx >= len(segments) and idx - 1 < len(segments):
+                    idx = idx - 1
+
+            if idx is not None and isinstance(idx, int) and 0 <= idx < len(segments):
+                if hasattr(self, 'dispatched_indices') and idx in self.dispatched_indices:
+                    self.dispatched_indices.discard(idx)
+
+            if status == "success" and idx is not None and isinstance(idx, int) and 0 <= idx < len(segments):
+                segments[idx]["copied"] = True
+                segments[idx]["completed"] = True
+                segments[idx]["status"] = "success"
+                self.copied_rows.add(idx)
+                updated_count += 1
+                
+                # 如果没有显式指定 target_path_str，自动推导为 project_path/downloads/videos/01.mp4 等标准路径
+                if not target_path_str and self.project_path:
+                    videos_dir = self.project_path / "downloads" / "videos"
+                    videos_dir.mkdir(parents=True, exist_ok=True)
+                    target_path_str = str((videos_dir / f"{idx + 1:02d}.mp4").resolve())
+
+                download_success = False
+                target_filename = item.get("target_filename")
+                project_name = item.get("project_name")
+                
+                # 1. 优先扫描 Chrome Downloads 目录并自动移动/复制至当前工程目录
+                possible_sources = []
+                if project_name and target_filename:
+                    possible_sources.append(chrome_downloads / "Flow" / project_name / target_filename)
+                if target_filename:
+                    possible_sources.append(chrome_downloads / "Flow" / target_filename)
+                
+                if self.project_model:
+                    p_id = self.project_model.project_id
+                    filename = Path(target_path_str).name
+                    possible_sources.extend([
+                        chrome_downloads / "Flow" / p_id / filename,
+                        chrome_downloads / "Flow" / f"{p_id}-flow" / filename,
+                        chrome_downloads / "Flow" / filename,
+                        chrome_downloads / filename,
+                    ])
+
+                source_file = None
+                for p in possible_sources:
+                    if p.exists() and p.is_file() and p.stat().st_size > 1024:
+                        source_file = p
+                        break
+                
+                # 通配扫描最近在 Downloads/Flow 目录中生成的 mp4 文件
+                if not source_file:
+                    flow_dir = chrome_downloads / "Flow"
+                    if flow_dir.exists():
+                        recent_mp4s = list(flow_dir.glob("**/*.mp4"))
+                        recent_mp4s.sort(key=lambda f: f.stat().st_mtime, reverse=True)
+                        if recent_mp4s:
+                            # 取最新的一个 mp4 文件
+                            source_file = recent_mp4s[0]
+
+                if source_file and target_path_str:
+                    try:
+                        target_path = Path(target_path_str)
+                        target_path.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.copy2(source_file, target_path)
+                        download_success = True
+                        logger.info(f"✅ [Chrome 下载扫描成功] 成功将下载文件 {source_file} 归档至: {target_path}")
+                    except Exception as copy_err:
+                        logger.warning(f"复制 Chrome 下载文件异常: {copy_err}")
+
+                # 2. 次选方案：解码 Base64 视频字节流直接写入
+                if not download_success and base64_data and target_path_str:
+                    try:
+                        target_path = Path(target_path_str)
+                        target_path.parent.mkdir(parents=True, exist_ok=True)
+                        video_bytes = base64.b64decode(base64_data)
+                        if len(video_bytes) > 1024:
+                            with open(target_path, "wb") as f:
+                                f.write(video_bytes)
+                            download_success = True
+                            logger.info(f"✅ Base64 视频字节流成功写入: {target_path}")
+                    except Exception as b64_err:
+                        logger.warning(f"解码 Base64 视频失败: {b64_err}")
+
+                # 3. 备用方案：HTTP 直连流下载
+                if not download_success and download_url and target_path_str:
+                    try:
+                        import requests
+                        target_path = Path(target_path_str)
+                        target_path.parent.mkdir(parents=True, exist_ok=True)
+                        headers = {
+                            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+                        }
+                        resp = requests.get(download_url, headers=headers, allow_redirects=True, stream=True, timeout=60)
+                        if resp.status_code == 200:
+                            with open(target_path, "wb") as f:
+                                for chunk in resp.iter_content(chunk_size=16384):
+                                    f.write(chunk)
+                            download_success = True
+                            logger.info(f"✅ HTTP 直连下载成功: {target_path}")
+                    except Exception as dl_err:
+                        logger.warning(f"HTTP 直连下载异常: {dl_err}")
+
+                # 4. 延迟 1.5 秒与 4 秒再次扫描 Chrome 下载目录 (解决 Chrome 写入未完成问题)
+                if not download_success and target_path_str:
+                    def try_delayed_copy(tp_str=target_path_str):
+                        tp = Path(tp_str)
+                        flow_dir = chrome_downloads / "Flow"
+                        if flow_dir.exists():
+                            recent_mp4s = list(flow_dir.glob("**/*.mp4"))
+                            recent_mp4s.sort(key=lambda f: f.stat().st_mtime, reverse=True)
+                            if recent_mp4s:
+                                try:
+                                    tp.parent.mkdir(parents=True, exist_ok=True)
+                                    shutil.copy2(recent_mp4s[0], tp)
+                                    logger.info(f"✅ 延迟扫描归档成功复制 {recent_mp4s[0]} 至: {tp}")
+                                    if hasattr(self, 'populate_segments_table'):
+                                        self.populate_segments_table()
+                                except Exception as e:
+                                    logger.warning(f"延迟复制视频失败: {e}")
+
+                    QTimer.singleShot(1500, try_delayed_copy)
+                    QTimer.singleShot(4000, try_delayed_copy)
+
+        if updated_count > 0:
+            self.project_model.save()
+            self.populate_segments_table()
+            
+        if self.is_auto_polling_active:
+            QTimer.singleShot(300, self.run_polling_dispatcher_cycle)
+
+    def pack_batch_for_capacity(self, capacity_points, max_tasks=None):
+        """
+        Packs a task batch from current project's uncompleted segments to fit capacity_points,
+        optionally limiting to max_tasks for optimal load-balancing across multiple online workers.
+        """
+        if not self.project_model or not self.project_model.spanish_segments:
+            return []
+
+        segments = self.project_model.spanish_segments
+        all_unprocessed_tasks = []
+        for idx, seg in enumerate(segments):
+            # 排除已经被分配给其他正在运行 Worker 的任务
+            if hasattr(self, 'dispatched_indices') and idx in self.dispatched_indices:
+                continue
+
+            # 超过 3 次重试失败的顽固片段，先临时跳过，防止阻塞整个工程与流水线
+            if hasattr(self, 'failed_skip_indices') and idx in self.failed_skip_indices:
+                continue
+
+            videos_dir = self.project_path / "downloads" / "videos" if self.project_path else Path("downloads/videos")
+            download_name = f"{idx+1:02d}.mp4"
+            download_path_obj = (videos_dir / download_name).resolve()
+            download_path = str(download_path_obj)
+
+            # 核心判重与断点续跑：以本地硬盘是否真实存在该序号的非空 mp4 视频文件为唯一判重标准！
+            if download_path_obj.exists() and download_path_obj.stat().st_size > 0:
+                seg["copied"] = True
+                seg["completed"] = True
+                if hasattr(self, 'copied_rows'):
+                    self.copied_rows.add(idx)
+                if hasattr(self, 'segment_retry_counts'):
+                    self.segment_retry_counts.pop(idx, None)
+                if hasattr(self, 'failed_skip_indices'):
+                    self.failed_skip_indices.discard(idx)
+                continue
+            else:
+                seg["copied"] = False
+                seg["completed"] = False
+                if hasattr(self, 'copied_rows'):
+                    self.copied_rows.discard(idx)
+
+            raw_text = seg.get("text", "")
+            text = TextProcessor.remove_punctuation(raw_text)
+            
+            tpl, motion = self.get_effective_template_and_motion(idx)
+            template_content = tpl["content"] if tpl else "{spanish_text}"
+            motion_content = motion["content"] if motion else ""
+            
+            final_prompt = template_content.replace("{spanish_text}", text)
+            final_prompt = final_prompt.replace("{camera_motion}", motion_content)
+            final_prompt = re.sub(r' +', ' ', final_prompt).strip()
+            
+            image_name, local_image_path, image_data_url = self.resolve_segment_image_and_data(idx, seg)
+            mode = seg.get("mode", "VIDEO_FRAMES")
+            duration = seg.get("duration", 6)
+                
+            videos_dir = self.project_path / "downloads" / "videos" if self.project_path else Path("downloads/videos")
+            download_name = f"{idx+1:02d}.mp4"
+            download_path = str((videos_dir / download_name).resolve())
+            
+            all_unprocessed_tasks.append({
+                "index": idx,
+                "prompt": final_prompt,
+                "mode": mode,
+                "image_name": image_name,
+                "local_image_path": local_image_path,
+                "image_data_url": image_data_url,
+                "imageDataUrl": image_data_url,
+                "duration": duration,
+                "download_path": download_path,
+                "_raw_duration": duration,
+                "_original_index": idx,
+                "_text_len": len(text)
+            })
+
+        if not all_unprocessed_tasks or capacity_points < 7:
+            return []
+
+        def get_task_points_val(dur):
+            if self.config_manager:
+                return self.config_manager.get_points_for_duration(dur)
+            points_map = {10: 15, 8: 12, 6: 10, 4: 7}
+            return points_map.get(dur, 7)
+
+        def get_task_points(task):
+            return get_task_points_val(task.get("duration", task.get("_raw_duration", 6)))
+
+        # Sort tasks descending by points
+        sorted_tasks = sorted(all_unprocessed_tasks, key=get_task_points, reverse=True)
+
+        batch = []
+        cur_pts = 0
+        for task in sorted_tasks:
+            if max_tasks is not None and len(batch) >= max_tasks:
+                break
+            pts = get_task_points(task)
+            if cur_pts + pts <= capacity_points:
+                batch.append(task)
+                cur_pts += pts
+
+        if not batch:
+            return []
+
+        batch.sort(key=lambda t: t["_original_index"])
+        
+        cleaned_batch = []
+        for item in batch:
+            cleaned_item = {k: v for k, v in item.items() if not k.startswith("_")}
+            cleaned_batch.append(cleaned_item)
+            
+        return cleaned_batch
+
+    def start_auto_polling_dispatcher(self):
+        """Starts the auto-polling task dispatcher for the current project."""
+        if not self.plugin_server:
+            QMessageBox.warning(self, "提示", "WebSocket 插件服务端未启动。")
+            return
+
+        tpl_id = self.combo_templates.currentData() if hasattr(self, "combo_templates") else None
+        if not tpl_id:
+            QMessageBox.warning(self, "提示", "⚠️ 请先在上方为当前工程选择【统一提示词模板】后再启动自动分发！")
+            return
+
+        clients = self.plugin_server.get_online_clients()
+        if not clients:
+            QMessageBox.warning(self, "提示", "⚠️ 当前没有在线的浏览器 Worker。\n\n请在 Chrome 浏览器中打开 Google Flow 网页。")
+            return
+
+        # 启动时彻底清空历史锁定索引、跳过记录与重试计数，确保每次启动所有未完成句子都能全量正常生成
+        self.dispatched_indices = set()
+        self.failed_skip_indices = set()
+        self.segment_retry_counts = {}
+        for socket, info in self.plugin_server.clients.items():
+            if info.get("remaining_points", 0) >= 7:
+                info["status"] = "idle"
+            else:
+                info["status"] = "low_points"
+            info["current_batch"] = None
+
+        usable_clients = [c for c in clients if c.get("remaining_points", 0) >= 7]
+        if not usable_clients:
+            total_pts = sum(c.get("remaining_points", 0) for c in clients)
+            QMessageBox.warning(
+                self, "积分不足提示",
+                f"⚠️ 当前在线的 {len(clients)} 个浏览器 Worker 积分均不足 7 点（当前总积分剩余 {total_pts} 点，不足以支付一个视频）。\n\n"
+                "请点击【🔄 刷新点数】重新探测，或更换有积分的 Google 账号。"
+            )
+            return
+            
+        self.is_auto_polling_active = True
+        if not hasattr(self, "polling_timer") or not self.polling_timer:
+            self.polling_timer = QTimer(self)
+            self.polling_timer.timeout.connect(self.run_polling_dispatcher_cycle)
+            
+        self.run_polling_dispatcher_cycle()
+        self.polling_timer.start(4000) # Poll every 4 seconds
+
+    def stop_auto_polling_dispatcher(self):
+        """Stops the auto-polling task dispatcher."""
+        self.is_auto_polling_active = False
+        if hasattr(self, "polling_timer") and self.polling_timer:
+            self.polling_timer.stop()
+
+    def run_polling_dispatcher_cycle(self):
+        """Runs one cycle of the auto-polling dispatcher for this project."""
+        if not self.is_auto_polling_active:
+            return
+
+        if not self.project_model or not self.project_model.spanish_segments:
+            self.stop_auto_polling_dispatcher()
+            return
+
+        segments = self.project_model.spanish_segments
+        videos_dir = self.project_path / "downloads" / "videos" if self.project_path else Path("downloads/videos")
+
+        clients = self.plugin_server.get_online_clients()
+        idle_clients = [c for c in clients if c.get("status") == "idle" and c.get("remaining_points", 0) >= 7]
+
+        # 1. 动态释放任务锁定：若没有 busy Worker 在跑，彻底释放 dispatched_indices 供下一次重试！
+        busy_workers = [c for c in clients if c.get("status") == "busy"]
+        if not busy_workers and hasattr(self, 'dispatched_indices'):
+            self.dispatched_indices.clear()
+
+        def check_seg_done(i):
+            p = (videos_dir / f"{i+1:02d}.mp4").resolve()
+            return p.exists() and p.stat().st_size > 0
+
+        # 2. 检查所有未完成的句子：若重试次数已达 3 次，立即加入 failed_skip_indices
+        if not hasattr(self, 'failed_skip_indices'):
+            self.failed_skip_indices = set()
+        if not hasattr(self, 'segment_retry_counts'):
+            self.segment_retry_counts = {}
+
+        for idx, _ in enumerate(segments):
+            if not check_seg_done(idx):
+                if self.segment_retry_counts.get(idx, 0) >= 3:
+                    self.failed_skip_indices.add(idx)
+
+        uncompleted_count = sum(
+            1 for idx, _ in enumerate(segments)
+            if not (check_seg_done(idx) or idx in self.failed_skip_indices)
+        )
+
+        if uncompleted_count == 0:
+            self.stop_auto_polling_dispatcher()
+            skip_count = len(self.failed_skip_indices)
+            if skip_count > 0:
+                logger.info(f"🎉 当前工程已完成所有可生成视频（有 {skip_count} 句重试 3 次未出片已自动先跳过）！")
+            else:
+                logger.info("🎉 当前工程所有视频已全部在本地磁盘生成就绪！")
+            if self.active_batch_dialog:
+                self.active_batch_dialog.update_polling_ui()
+            return
+
+        if not idle_clients:
+            return
+
+        # 智能全并行负载均衡：计算每个 Worker 应分担的任务上限，确保所有在线浏览器全部动起来！
+        remaining_tasks_count = sum(
+            1 for idx, _ in enumerate(segments)
+            if not (check_seg_done(idx) or (hasattr(self, 'dispatched_indices') and idx in self.dispatched_indices) or idx in self.failed_skip_indices)
+        )
+        
+        tasks_per_worker = max(1, (remaining_tasks_count + len(idle_clients) - 1) // len(idle_clients)) if remaining_tasks_count > 0 else 5
+        logger.info(f"🔄 调度周期: 剩余待分发任务数={remaining_tasks_count}, 空闲有分Worker数={len(idle_clients)}, 单Worker配额={tasks_per_worker}")
+
+        for client in idle_clients:
+            pts = client.get("remaining_points", 0)
+            if pts < 7:
+                continue
+            batch_tasks = self.pack_batch_for_capacity(pts, max_tasks=tasks_per_worker)
+            if batch_tasks:
+                task_indices = [t["index"] for t in batch_tasks if "index" in t]
+                for idx in task_indices:
+                    self.dispatched_indices.add(idx)
+                    # 记录并累加重试计数
+                    self.segment_retry_counts[idx] = self.segment_retry_counts.get(idx, 0) + 1
+                    
+                    # 若重试达 3 次且本地仍无文件，加入跳过集合
+                    if self.segment_retry_counts[idx] >= 3:
+                        self.failed_skip_indices.add(idx)
+                        logger.warning(f"⚠️ [智能熔断] 第 {idx+1} 句已累计重试 3 次未成功出片，自动先跳过以保障流水线顺畅推进！")
+
+                batch_id = f"{self.project_model.project_id}_{int(QDateTime.currentMSecsSinceEpoch())}_{client['client_id']}"
+                logger.info(f"🚀 向 Worker [{client['client_id']}] 派发任务 ({len(batch_tasks)}条, 序号: {task_indices})")
+                self.plugin_server.send_tasks_to_client(client["client_id"], batch_id, batch_tasks)
+                if self.active_batch_dialog and self.active_batch_dialog.isVisible():
+                    self.active_batch_dialog.refresh_workers_list()
+
 
 class BatchExportDialog(QDialog):
     def __init__(self, parent, batches, config_manager=None, skipped_count=0):
         super().__init__(parent)
+        self.project_widget = parent if hasattr(parent, "start_auto_polling_dispatcher") else None
+        if self.project_widget:
+            self.project_widget.active_batch_dialog = self
+
         self.cm = config_manager
         self.skipped_count = skipped_count
         max_pts = self.cm.max_batch_points if self.cm else 50
-        self.setWindowTitle(f"分批复制生成任务 (每批最高{max_pts}积分)")
-        self.resize(550, 400)
+        self.setWindowTitle(f"分批生成与多浏览器调度 (最高{max_pts}积分/批)")
+        self.resize(620, 520)
         self.batches = batches  # List of lists of dicts
         self.copied_batches = set()
         self.init_ui()
         
+    def closeEvent(self, event):
+        if self.project_widget:
+            self.project_widget.active_batch_dialog = None
+        super().closeEvent(event)
+
     def init_ui(self):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(15, 15, 15, 15)
@@ -1997,7 +2595,7 @@ class BatchExportDialog(QDialog):
         lbl_summary = QLabel(
             f"📊 <b>统计信息</b>：共 <b>{total_segments}</b> 个待生成视频片段{skipped_text}，"
             f"总需 <b>{total_points}</b> 积分。<br/>"
-            f"每批次点数上限为 <b>{max_pts}</b> 积分，已智能分拆为 <b>{len(self.batches)}</b> 个批次进行生成。"
+            f"每批次上限为 <b>{max_pts}</b> 积分，已拆为 <b>{len(self.batches)}</b> 个批次。"
         )
         lbl_summary.setStyleSheet("font-size: 13px; color: #5D4037;")
         layout.addWidget(lbl_summary)
@@ -2015,7 +2613,6 @@ class BatchExportDialog(QDialog):
         for idx, batch in enumerate(self.batches):
             item = QListWidgetItem(self.list_batches)
             
-            # Create a widget for the item
             widget = QWidget()
             widget_layout = QHBoxLayout(widget)
             widget_layout.setContentsMargins(10, 8, 10, 8)
@@ -2031,7 +2628,6 @@ class BatchExportDialog(QDialog):
             lbl_info.setStyleSheet("font-size: 12px; color: #5D4037;")
             widget_layout.addWidget(lbl_info, stretch=1)
             
-            # Copy Button
             btn_copy = QPushButton("📋 复制本批任务")
             btn_copy.setStyleSheet("""
                 QPushButton {
@@ -2061,7 +2657,15 @@ class BatchExportDialog(QDialog):
         btn_close.setStyleSheet("background-color: #E0A96D; color: white; padding: 6px; font-weight: bold; border-radius: 4px;")
         btn_close.clicked.connect(self.accept)
         layout.addWidget(btn_close)
-        
+
+    def refresh_workers_list(self):
+        """No-op stub for backward compatibility."""
+        pass
+
+    def update_polling_ui(self):
+        """No-op stub for backward compatibility."""
+        pass
+
     def get_batch_points(self, batch):
         if self.cm:
             return sum(self.cm.get_points_for_duration(item.get("duration", item.get("_raw_duration", 6))) for item in batch)
@@ -2079,7 +2683,6 @@ class BatchExportDialog(QDialog):
         import json
         batch_data = self.batches[batch_idx]
         
-        # Strip internal temporary keys before copying to clipboard
         cleaned_batch = []
         for item in batch_data:
             c_item = {k: v for k, v in item.items() if not k.startswith("_")}
@@ -2091,7 +2694,6 @@ class BatchExportDialog(QDialog):
             clipboard = QGuiApplication.clipboard()
             clipboard.setText(json_str)
             
-            # Visual feedback
             button.setText("✓ 已复制")
             button.setStyleSheet("""
                 QPushButton {
@@ -2108,3 +2710,4 @@ class BatchExportDialog(QDialog):
         except Exception as e:
             from PyQt6.QtWidgets import QMessageBox
             QMessageBox.critical(self, "错误", f"复制批次失败: {e}")
+

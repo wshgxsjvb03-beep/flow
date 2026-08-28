@@ -7,7 +7,7 @@ from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel,
                              QPushButton, QTextEdit, QListWidget, QListWidgetItem,
                              QSplitter, QComboBox, QFrame, QProgressBar,
                              QMessageBox, QGroupBox, QScrollArea)
-from PyQt6.QtCore import Qt, QUrl
+from PyQt6.QtCore import Qt, QUrl, pyqtSignal
 from PyQt6.QtGui import QColor, QFont, QDesktopServices
 
 # Optional multimedia support - graceful fallback if not installed
@@ -26,11 +26,13 @@ class VideoCompareWidget(QWidget):
     """Widget for comparing video segments against their original script text.
     
     Layout:
-    - Top: Summary statistics bar (total, checked, unchecked, missing)
+    - Top: Summary statistics bar (total, checked, unchecked, missing, marked delete)
     - Bottom-Left: Segment navigation list
     - Bottom-Right-Top: Video player
     - Bottom-Right-Bottom: Dual-column text comparison (original vs extracted)
     """
+    
+    videos_deleted = pyqtSignal()
     
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -155,6 +157,10 @@ class VideoCompareWidget(QWidget):
         self.lbl_missing = QLabel("❌ 缺失: 0")
         self.lbl_missing.setStyleSheet("font-weight: bold; color: #C62828; font-size: 13px;")
         summary_layout.addWidget(self.lbl_missing)
+
+        self.lbl_marked_delete = QLabel("🗑️ 待删除: 0")
+        self.lbl_marked_delete.setStyleSheet("font-weight: bold; color: #DC2626; font-size: 13px;")
+        summary_layout.addWidget(self.lbl_marked_delete)
         
         # Progress bar
         self.progress_bar = QProgressBar()
@@ -189,6 +195,25 @@ class VideoCompareWidget(QWidget):
         self.btn_extract_all.setToolTip("调用 API 批量提取所有视频中的语音文案")
         self.btn_extract_all.clicked.connect(self.extract_all_texts)
         summary_layout.addWidget(self.btn_extract_all)
+
+        # Batch delete marked videos button
+        self.btn_delete_marked = QPushButton("🗑️ 一键删除标记视频")
+        self.btn_delete_marked.setObjectName("btn_delete_marked")
+        self.btn_delete_marked.setStyleSheet("""
+            QPushButton#btn_delete_marked {
+                background-color: #DC2626;
+                color: white;
+                font-weight: bold;
+                padding: 6px 14px;
+                border-radius: 4px;
+            }
+            QPushButton#btn_delete_marked:hover { background-color: #B91C1C; }
+            QPushButton#btn_delete_marked:disabled { background-color: #D7CCC8; color: #A1887F; }
+        """)
+        self.btn_delete_marked.setToolTip("一键彻底删除所有已标记句段的本地视频文件并重置状态")
+        self.btn_delete_marked.clicked.connect(self.batch_delete_marked_videos)
+        self.btn_delete_marked.setEnabled(False)
+        summary_layout.addWidget(self.btn_delete_marked)
         
         root_layout.addWidget(summary_frame)
         
@@ -213,6 +238,7 @@ class VideoCompareWidget(QWidget):
         self.combo_filter.addItem("✅ 已归位", "relocated")
         self.combo_filter.addItem("⚪ 待核对", "unchecked")
         self.combo_filter.addItem("🟢 已核对", "checked")
+        self.combo_filter.addItem("🗑️ 待删除", "marked_delete")
         self.combo_filter.addItem("❌ 缺失", "missing")
         self.combo_filter.setFixedWidth(110)
         self.combo_filter.currentIndexChanged.connect(self.apply_filter)
@@ -426,6 +452,21 @@ class VideoCompareWidget(QWidget):
         self.btn_mark_unchecked.setStyleSheet("background-color: #B0BEC5; color: #37474F;")
         self.btn_mark_unchecked.clicked.connect(self.mark_unchecked)
         action_layout.addWidget(self.btn_mark_unchecked)
+
+        self.btn_mark_delete = QPushButton("🗑️ 标记删除")
+        self.btn_mark_delete.setObjectName("btn_mark_delete")
+        self.btn_mark_delete.setStyleSheet("""
+            QPushButton#btn_mark_delete {
+                background-color: #EF4444;
+                color: white;
+            }
+            QPushButton#btn_mark_delete:hover {
+                background-color: #DC2626;
+            }
+        """)
+        self.btn_mark_delete.setToolTip("标记当前视频为错误/待重刷，之后可一键删除本地视频文件")
+        self.btn_mark_delete.clicked.connect(self.toggle_mark_delete)
+        action_layout.addWidget(self.btn_mark_delete)
         
         compare_layout.addLayout(action_layout)
         
@@ -452,17 +493,43 @@ class VideoCompareWidget(QWidget):
     # ═══════════════════════════════════════════════════════
     def set_project(self, project_model, project_path, config_manager=None):
         """Called when project is loaded/changed. Populates all data."""
+        self.cleanup()
         self.project_model = project_model
         self.project_path = Path(project_path) if project_path else None
         self.config_manager = config_manager
         self.current_segment_index = -1
         self._current_video_path = None
         
-        # Stop any playing video
-        if self.media_player:
-            self.media_player.stop()
-        
         self.refresh_data()
+    
+    def cleanup(self):
+        """Stops media player and active extraction worker thread cleanly."""
+        if hasattr(self, "media_player") and self.media_player:
+            try:
+                self.media_player.stop()
+                self.media_player.setSource(QUrl())
+            except Exception:
+                pass
+                
+        if hasattr(self, "_extraction_worker") and self._extraction_worker:
+            try:
+                if self._extraction_worker.isRunning():
+                    self._extraction_worker.stop()
+            except Exception:
+                pass
+            self._extraction_worker = None
+
+    def closeEvent(self, event):
+        self.cleanup()
+        super().closeEvent(event)
+
+    def hideEvent(self, event):
+        if hasattr(self, "media_player") and self.media_player:
+            try:
+                self.media_player.stop()
+            except Exception:
+                pass
+        super().hideEvent(event)
     
     def refresh_data(self):
         """Re-runs video check and refreshes all UI elements."""
@@ -501,6 +568,10 @@ class VideoCompareWidget(QWidget):
         self.lbl_checked.setText("✅ 已核对: 0")
         self.lbl_unchecked.setText("⚪ 待核对: 0")
         self.lbl_missing.setText("❌ 缺失: 0")
+        self.lbl_marked_delete.setText("🗑️ 待删除: 0")
+        if hasattr(self, "btn_delete_marked") and self.btn_delete_marked:
+            self.btn_delete_marked.setEnabled(False)
+            self.btn_delete_marked.setText("🗑️ 一键删除标记视频")
         self.progress_bar.setValue(0)
         self._clear_detail()
     
@@ -512,6 +583,9 @@ class VideoCompareWidget(QWidget):
         self.lbl_similarity.setText("相似度: —")
         self.lbl_video_info.setText("未选择视频文件")
         self.lbl_video_time.setText("00:00 / 00:00")
+        if hasattr(self, "btn_mark_delete") and self.btn_mark_delete:
+            self.btn_mark_delete.setText("🗑️ 标记删除")
+            self.btn_mark_delete.setEnabled(False)
         if self.media_player:
             self.media_player.stop()
         self._current_video_path = None
@@ -540,9 +614,12 @@ class VideoCompareWidget(QWidget):
             is_relocated = detail.get("already_in_target", False)
             is_missing = not is_found
             is_checked = seg_data.get("checked", False)
+            is_marked_delete = seg_data.get("marked_for_deletion", False)
             
             # Apply filter
-            if current_filter == "relocated" and not is_relocated:
+            if current_filter == "marked_delete" and not is_marked_delete:
+                continue
+            elif current_filter == "relocated" and not is_relocated:
                 continue
             elif current_filter == "unchecked" and (is_checked or is_missing):
                 continue
@@ -561,7 +638,10 @@ class VideoCompareWidget(QWidget):
             has_extracted = bool(seg_data.get("extracted_text", ""))
             
             # Build display label
-            if is_missing:
+            if is_marked_delete:
+                video_icon = "🗑️"
+                check_icon = "[待删除]"
+            elif is_missing:
                 video_icon = "❌"
                 check_icon = "—"
             elif is_relocated:
@@ -588,7 +668,13 @@ class VideoCompareWidget(QWidget):
             item.setData(Qt.ItemDataRole.UserRole, i)  # Store real index
             
             # Color coding
-            if is_missing:
+            if is_marked_delete:
+                item.setForeground(QColor("#DC2626"))
+                font = item.font()
+                font.setBold(True)
+                item.setFont(font)
+                item.setToolTip("⚠️ 该句段已标记为待删除，点击上方【一键删除标记视频】可清理本地文件并重新导出。")
+            elif is_missing:
                 item.setForeground(QColor("#C62828"))
             elif is_flagged or (has_extracted and similarity > 0 and similarity < 70):
                 # Mismatch flagged or low similarity -> RED
@@ -612,6 +698,7 @@ class VideoCompareWidget(QWidget):
         segments = self.project_model.spanish_segments
         total = len(segments)
         checked_count = sum(1 for s in segments if s.get("checked", False))
+        marked_delete_count = sum(1 for s in segments if s.get("marked_for_deletion", False))
         
         # Count based on video report
         missing = self.video_report.get("missing_count", 0)
@@ -623,6 +710,15 @@ class VideoCompareWidget(QWidget):
         self.lbl_checked.setText(f"✅ 已核对: {checked_count}")
         self.lbl_unchecked.setText(f"⚪ 待核对: {unchecked}")
         self.lbl_missing.setText(f"❌ 缺失: {missing}")
+        self.lbl_marked_delete.setText(f"🗑️ 待删除: {marked_delete_count}")
+
+        # Update batch delete button
+        if hasattr(self, "btn_delete_marked") and self.btn_delete_marked:
+            self.btn_delete_marked.setEnabled(marked_delete_count > 0)
+            if marked_delete_count > 0:
+                self.btn_delete_marked.setText(f"🗑️ 一键删除标记 ({marked_delete_count})")
+            else:
+                self.btn_delete_marked.setText("🗑️ 一键删除标记视频")
         
         # Progress
         pct = int(checked_count / total * 100) if total > 0 else 0
@@ -702,6 +798,35 @@ class VideoCompareWidget(QWidget):
             self.txt_extracted.clear()
             self.lbl_similarity.setText("相似度: —")
             self.lbl_similarity.setStyleSheet("font-size: 13px; font-weight: bold; color: #8D6E63; padding: 2px 8px;")
+
+        # Update mark delete button
+        if hasattr(self, "btn_mark_delete") and self.btn_mark_delete:
+            self.btn_mark_delete.setEnabled(True)
+            is_marked = seg.get("marked_for_deletion", False)
+            if is_marked:
+                self.btn_mark_delete.setText("↩ 取消待删")
+                self.btn_mark_delete.setStyleSheet("""
+                    QPushButton#btn_mark_delete {
+                        background-color: #9CA3AF;
+                        color: white;
+                    }
+                    QPushButton#btn_mark_delete:hover {
+                        background-color: #6B7280;
+                    }
+                """)
+                self.btn_mark_delete.setToolTip("取消当前句段的待删除标记")
+            else:
+                self.btn_mark_delete.setText("🗑️ 标记删除")
+                self.btn_mark_delete.setStyleSheet("""
+                    QPushButton#btn_mark_delete {
+                        background-color: #EF4444;
+                        color: white;
+                    }
+                    QPushButton#btn_mark_delete:hover {
+                        background-color: #DC2626;
+                    }
+                """)
+                self.btn_mark_delete.setToolTip("标记当前视频为错误/待重刷，之后可一键删除本地视频文件")
         
         # Load video
         is_found = detail.get("found", False)
@@ -786,85 +911,105 @@ class VideoCompareWidget(QWidget):
         return f"{m:02d}:{s:02d}"
     
     @staticmethod
+    def _clean_word_for_display(word):
+        """Strips leading/trailing punctuation and converts to lowercase for clean comparison display.
+        Preserves Spanish accent characters (á, é, í, ó, ú, ü, ñ).
+        Does NOT modify underlying project model data.
+        """
+        import re
+        w = word.lower().strip()
+        w = re.sub(r'^[^\w]+|[^\w]+$', '', w, flags=re.UNICODE)
+        return w
+
+    @staticmethod
+    def _normalize_word_for_compare(word):
+        """Internal helper to clean a word for matching only (ignores punctuation, case, accents).
+        Does NOT modify original text data.
+        """
+        import re
+        w = word.lower().strip()
+        w = re.sub(r'[^\w]', '', w, flags=re.UNICODE)
+        accent_map = str.maketrans({
+            'á': 'a', 'é': 'e', 'í': 'i', 'ó': 'o', 'ú': 'u', 'ü': 'u',
+            'à': 'a', 'è': 'e', 'ì': 'i', 'ò': 'o', 'ù': 'u',
+        })
+        return w.translate(accent_map)
+
+    @staticmethod
     def _build_diff_html(original, extracted):
-        """Builds HTML diff for original and extracted text.
+        """Builds HTML diff for original and extracted text in-memory.
+        Displays in clean all-lowercase format without punctuation.
+        The reference script (left) is kept completely clean without annotations,
+        while all issues (missing words, extra words, misread words) are marked
+        exclusively in the AI extracted text (right).
         
         Returns:
             tuple: (original_html, extracted_html)
-            - original_html: original text with MISSING parts (in extracted) highlighted red
-            - extracted_html: extracted text with EXTRA/DIFFERENT parts highlighted red,
-              and matching parts in normal color
         """
         import difflib
         import html as html_module
         
+        base_style = 'font-family:"Segoe UI",sans-serif; font-size:13px; line-height:1.6;'
+        
         if not original and not extracted:
             return "", ""
         if not original:
-            return "", f'<span style="color:#3E2723;">{html_module.escape(extracted)}</span>'
+            clean_ext = " ".join([VideoCompareWidget._clean_word_for_display(w) for w in extracted.split() if VideoCompareWidget._clean_word_for_display(w)])
+            return "", f'<div style="{base_style}"><span style="color:#3E2723;">{html_module.escape(clean_ext)}</span></div>'
         if not extracted:
-            return f'<span style="color:#3E2723;">{html_module.escape(original)}</span>', ""
+            clean_orig = " ".join([VideoCompareWidget._clean_word_for_display(w) for w in original.split() if VideoCompareWidget._clean_word_for_display(w)])
+            return f'<div style="{base_style}"><span style="color:#3E2723;">{html_module.escape(clean_orig)}</span></div>', ""
         
-        # Use SequenceMatcher for word-level diff
-        orig_words = original.split()
-        ext_words = extracted.split()
+        # Word tokens for display (all-lowercase, punctuation stripped)
+        orig_words = [VideoCompareWidget._clean_word_for_display(w) for w in original.split()]
+        orig_words = [w for w in orig_words if w]
         
-        sm = difflib.SequenceMatcher(None, orig_words, ext_words)
+        ext_words = [VideoCompareWidget._clean_word_for_display(w) for w in extracted.split()]
+        ext_words = [w for w in ext_words if w]
         
-        orig_parts = []
+        # Normalized word tokens for in-memory matching (accents also stripped)
+        orig_norm = [VideoCompareWidget._normalize_word_for_compare(w) for w in orig_words]
+        ext_norm = [VideoCompareWidget._normalize_word_for_compare(w) for w in ext_words]
+        
+        sm = difflib.SequenceMatcher(None, orig_norm, ext_norm)
+        
         ext_parts = []
         
         for tag, i1, i2, j1, j2 in sm.get_opcodes():
             if tag == 'equal':
                 # Matching text - normal color
-                text_o = " ".join(orig_words[i1:i2])
                 text_e = " ".join(ext_words[j1:j2])
-                orig_parts.append(f'<span style="color:#3E2723;">{html_module.escape(text_o)}</span>')
                 ext_parts.append(f'<span style="color:#3E2723;">{html_module.escape(text_e)}</span>')
             elif tag == 'replace':
-                # Different text - red background on both sides
-                text_o = " ".join(orig_words[i1:i2])
+                # Misread/different text in audio - red background
                 text_e = " ".join(ext_words[j1:j2])
-                orig_parts.append(
-                    f'<span style="background-color:#FFCDD2; color:#B71C1C; '
-                    f'font-weight:bold; border-radius:2px; padding:1px 2px;">'
-                    f'{html_module.escape(text_o)}</span>'
-                )
                 ext_parts.append(
                     f'<span style="background-color:#FFCDD2; color:#B71C1C; '
                     f'font-weight:bold; border-radius:2px; padding:1px 2px;">'
                     f'{html_module.escape(text_e)}</span>'
                 )
             elif tag == 'delete':
-                # In original but NOT in extracted - mark red in original, show gap in extracted
+                # In original but NOT in extracted (Missing words / 漏词) -> mark in extracted side
                 text_o = " ".join(orig_words[i1:i2])
-                orig_parts.append(
-                    f'<span style="background-color:#EF9A9A; color:#B71C1C; '
-                    f'font-weight:bold; text-decoration:underline; border-radius:2px; padding:1px 2px;">'
-                    f'{html_module.escape(text_o)}</span>'
-                )
                 ext_parts.append(
                     f'<span style="background-color:#FFECB3; color:#E65100; '
-                    f'font-style:italic; border-radius:2px; padding:1px 2px;">'
-                    f'[缺失]</span>'
+                    f'font-weight:bold; font-style:italic; border-radius:2px; padding:1px 3px;">'
+                    f'[缺失: {html_module.escape(text_o)}]</span>'
                 )
             elif tag == 'insert':
-                # In extracted but NOT in original - mark in extracted, show gap in original
+                # In extracted but NOT in original (Extra words spoken / 多说词) -> mark green
                 text_e = " ".join(ext_words[j1:j2])
-                orig_parts.append(
-                    f'<span style="background-color:#FFECB3; color:#E65100; '
-                    f'font-style:italic; border-radius:2px; padding:1px 2px;">'
-                    f'[多余]</span>'
-                )
                 ext_parts.append(
                     f'<span style="background-color:#C8E6C9; color:#1B5E20; '
                     f'font-weight:bold; border-radius:2px; padding:1px 2px;">'
                     f'{html_module.escape(text_e)}</span>'
                 )
         
-        # Wrap with base styling
-        base_style = 'font-family:"Segoe UI",sans-serif; font-size:13px; line-height:1.6;'
-        orig_html = f'<div style="{base_style}">{" ".join(orig_parts)}</div>'
+        # Left side: Clean reference text without any markup
+        orig_clean_str = " ".join(orig_words)
+        orig_html = f'<div style="{base_style}"><span style="color:#3E2723;">{html_module.escape(orig_clean_str)}</span></div>'
+        
+        # Right side: Annotated extracted text
         ext_html = f'<div style="{base_style}">{" ".join(ext_parts)}</div>'
         
         return orig_html, ext_html
@@ -908,6 +1053,110 @@ class VideoCompareWidget(QWidget):
                 if item and item.data(Qt.ItemDataRole.UserRole) == self.current_segment_index:
                     self.list_segments.setCurrentRow(i)
                     break
+    
+    def toggle_mark_delete(self):
+        """Toggles marked for deletion state for the currently selected segment."""
+        if self.current_segment_index < 0 or not self.project_model:
+            return
+        
+        segments = self.project_model.spanish_segments
+        if self.current_segment_index < len(segments):
+            seg = segments[self.current_segment_index]
+            current_state = seg.get("marked_for_deletion", False)
+            new_state = not current_state
+            seg["marked_for_deletion"] = new_state
+            
+            if new_state:
+                # When marked for deletion, reset checked status
+                seg["checked"] = False
+                seg["auto_checked"] = False
+            
+            self.project_model.save()
+            
+            # Refresh UI
+            self._populate_segment_list()
+            self._update_summary()
+            
+            if new_state:
+                # Auto advance to next unchecked segment
+                self._advance_to_next_unchecked()
+            else:
+                # Re-load current segment to update button state
+                self._load_segment_detail(self.current_segment_index)
+
+    def batch_delete_marked_videos(self):
+        """Batch deletes local video files on disk for all segments marked for deletion."""
+        if not self.project_model or not self.project_path:
+            return
+        
+        segments = self.project_model.spanish_segments
+        marked_indices = [i for i, s in enumerate(segments) if s.get("marked_for_deletion", False)]
+        
+        if not marked_indices:
+            QMessageBox.information(self, "提示", "当前没有标记待删除的视频片段。")
+            return
+        
+        # Build segment numbers string for confirmation
+        indices_str = "、".join([f"{i+1:02d}" for i in marked_indices[:8]])
+        if len(marked_indices) > 8:
+            indices_str += f" 等共 {len(marked_indices)} 句"
+        else:
+            indices_str = f"第 {indices_str} 句（共 {len(marked_indices)} 句）"
+        
+        reply = QMessageBox.question(
+            self, "确认一键删除",
+            f"确定要删除已标记的 {len(marked_indices)} 个视频片段吗？\n\n"
+            f"涉及句段: {indices_str}\n\n"
+            f"• 本地视频文件将被彻底删除\n"
+            f"• 对应句段状态将重置为【❌ 缺失】\n"
+            f"• 在【文案、切分与提示词】导出批量生成 JSON 时将自动重新包含这些句段\n\n"
+            f"⚠️ 此操作不可逆，是否继续？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No
+        )
+        
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        
+        # Stop multimedia player to release Windows file locks
+        if hasattr(self, "media_player") and self.media_player:
+            try:
+                self.media_player.stop()
+                self.media_player.setSource(QUrl())
+            except Exception:
+                pass
+        
+        from services.video_checker import VideoChecker
+        
+        main_win = self.window()
+        base_storage_path = None
+        if hasattr(main_win, 'storage_manager'):
+            base_storage_path = main_win.storage_manager.get_base_path()
+        
+        res = VideoChecker.delete_segment_video_files(
+            self.project_model, self.project_path, marked_indices, base_storage_path=base_storage_path
+        )
+        
+        deleted_count = res.get("deleted_count", 0)
+        errors = res.get("errors", [])
+        
+        # Emit signal to inform parent widgets (like ProjectDetailWidget) to update table
+        self.videos_deleted.emit()
+        
+        # Refresh current video comparison data
+        self.refresh_data()
+        
+        error_msg = ""
+        if errors:
+            error_msg = "\n\n⚠️ 部分文件删除出现警告:\n" + "\n".join(errors[:5])
+        
+        QMessageBox.information(
+            self, "删除完成",
+            f"✅ 成功清理了 {deleted_count} 个本地视频文件！\n"
+            f"已重置对应句段状态为【缺失】。\n\n"
+            f"💡 您可以前往第一标签页【文案、切分与提示词】点击「导出批量生成 JSON」重新导出生成。"
+            f"{error_msg}"
+        )
     
     def _advance_to_next_unchecked(self):
         """Finds and selects the next unchecked segment after current."""
@@ -1012,6 +1261,14 @@ class VideoCompareWidget(QWidget):
         # Launch worker thread
         from services.speech_extractor import ExtractionWorker
         
+        if hasattr(self, "_extraction_worker") and self._extraction_worker:
+            try:
+                if self._extraction_worker.isRunning():
+                    self._extraction_worker.stop()
+            except Exception:
+                pass
+            self._extraction_worker = None
+        
         language = getattr(self.config_manager, "speech_language", "es")
         
         self._extraction_worker = ExtractionWorker(
@@ -1020,6 +1277,7 @@ class VideoCompareWidget(QWidget):
         self._extraction_worker.progress.connect(self._on_extraction_progress)
         self._extraction_worker.segment_done.connect(self._on_segment_extracted)
         self._extraction_worker.finished.connect(self._on_extraction_finished)
+        self._extraction_worker.finished.connect(self._extraction_worker.deleteLater)
         self._extraction_worker.start()
     
     def _on_extraction_progress(self, current, total, status_msg):

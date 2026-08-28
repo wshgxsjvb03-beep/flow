@@ -9,10 +9,10 @@ class ConfigManager:
     
     DEFAULT_MAX_BATCH_POINTS = 50
     DEFAULT_CHAR_DURATION_RULES = [
-        {"max_chars": 50, "duration": 4},
-        {"max_chars": 100, "duration": 6},
-        {"max_chars": 140, "duration": 8},
-        {"max_chars": 180, "duration": 10}
+        {"max_chars": 40, "duration": 4},
+        {"max_chars": 90, "duration": 6},
+        {"max_chars": 130, "duration": 8},
+        {"max_chars": 170, "duration": 10}
     ]
     DEFAULT_DURATION_POINTS_RULES = [
         {"duration": 4, "points": 7},
@@ -55,6 +55,10 @@ class ConfigManager:
         self._gladia_key_index = 0     # Current rotation index
         self._elevenlabs_key_index = 0 # Current rotation index
         
+        # Plugin server settings
+        self.enable_plugin_server = True
+        self.plugin_server_port = 18188
+        
         self.load()
 
     def load(self):
@@ -83,21 +87,35 @@ class ConfigManager:
                     self.gladia_api_keys = data.get("gladia_api_keys", [])
                     self.elevenlabs_api_keys = data.get("elevenlabs_api_keys", [])
                     self.speech_language = data.get("speech_language", self.DEFAULT_SPEECH_LANGUAGE)
+                    
+                    # Load plugin server settings
+                    self.enable_plugin_server = data.get("enable_plugin_server", True)
+                    self.plugin_server_port = data.get("plugin_server_port", 18188)
             except Exception as e:
                 print(f"Error loading config: {e}")
 
     def save(self):
-        """Saves current configuration to .app_config.json."""
-        data = {
-            "base_path": self.base_path,
+        """Saves current configuration to .app_config.json without losing existing keys."""
+        data = {}
+        if self.config_path.exists():
+            try:
+                with open(self.config_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+            except Exception:
+                data = {}
+
+        data.update({
+            "base_path": self.base_path or data.get("base_path", ""),
             "max_batch_points": self.max_batch_points,
             "forced_split_marker": self.forced_split_marker,
             "char_duration_rules": self.char_duration_rules,
             "duration_points_rules": self.duration_points_rules,
             "gladia_api_keys": self.gladia_api_keys,
             "elevenlabs_api_keys": self.elevenlabs_api_keys,
-            "speech_language": self.speech_language
-        }
+            "speech_language": self.speech_language,
+            "enable_plugin_server": self.enable_plugin_server,
+            "plugin_server_port": self.plugin_server_port
+        })
         try:
             with open(self.config_path, "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=4, ensure_ascii=False)
@@ -137,7 +155,7 @@ class ConfigManager:
         """Returns the maximum character threshold defined in char_duration_rules."""
         if self.char_duration_rules:
             return max(r["max_chars"] for r in self.char_duration_rules)
-        return 180
+        return 170
 
     def get_points_for_duration(self, duration):
         """Calculates points cost for a given duration in seconds."""

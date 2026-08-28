@@ -16,12 +16,16 @@ class TextProcessor:
     @staticmethod
     def clean_text(text):
         """Cleans input text according to user rules:
+        - Replaces newlines/CR with spaces (does not split on newlines)
         - Removes all emojis and symbols (like '👉', '📖', '✨')
         - Removes double quotes (", “, ”)
         - Converts emoji numbers (e.g. 3️⃣) to normal numbers
         """
         if not text:
             return ""
+            
+        # 0. Replace newlines and carriage returns with spaces
+        text = text.replace('\r', ' ').replace('\n', ' ')
             
         # 1. Replace emoji numbers (like 3️⃣) with normal numbers
         # Match digit followed by optional variation selector U+FE0F and enclosing keycap U+20E3
@@ -54,7 +58,7 @@ class TextProcessor:
         return text.strip()
 
     @staticmethod
-    def _split_long_chunk(chunk, max_len=180):
+    def _split_long_chunk(chunk, max_len=170):
         """Splits a single chunk that is longer than max_len into sub-chunks.
         Tries to split by comma first, then by space (words).
         """
@@ -107,7 +111,7 @@ class TextProcessor:
         if not text:
             return []
             
-        max_limit = config_manager.get_max_chars() if config_manager else 180
+        max_limit = config_manager.get_max_chars() if config_manager else 170
         custom_marker = getattr(config_manager, "forced_split_marker", "///") if config_manager else "///"
         
         # Build forced split markers pattern
@@ -133,8 +137,8 @@ class TextProcessor:
     def _segment_single_block(cleaned_text, max_limit, config_manager=None):
         """Segments a single forced block using sentence boundaries and greedy merging up to max_limit."""
         initial_chunks = []
-        # Split by newline or sentence-ending punctuation (., ?, !, ;, :) but keep punctuation for initial splitting.
-        pattern = re.compile(r'([^.!?;\n\r]+[.!?;\n\r]*)')
+        # Split by sentence-ending punctuation (., ?, !, ;) but keep punctuation for initial splitting.
+        pattern = re.compile(r'([^.!?;]+[.!?;\s]*)')
         matches = pattern.findall(cleaned_text)
         
         for m in matches:
@@ -177,11 +181,11 @@ class TextProcessor:
             if config_manager:
                 duration_val = config_manager.get_duration_for_length(length)
             else:
-                if length <= 50:
+                if length <= 40:
                     duration_val = 4
-                elif length <= 100:
+                elif length <= 90:
                     duration_val = 6
-                elif length <= 140:
+                elif length <= 130:
                     duration_val = 8
                 else:
                     duration_val = 10

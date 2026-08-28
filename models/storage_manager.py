@@ -30,10 +30,15 @@ class StorageManager:
                 self.base_path = None
 
     def save_config(self):
-        """Saves current configuration to workspace file."""
-        config = {
-            "base_path": str(self.base_path) if self.base_path else ""
-        }
+        """Saves current configuration to workspace file while preserving other settings."""
+        config = {}
+        if self.config_path.exists():
+            try:
+                with open(self.config_path, "r", encoding="utf-8") as f:
+                    config = json.load(f)
+            except Exception:
+                config = {}
+        config["base_path"] = str(self.base_path) if self.base_path else ""
         try:
             with open(self.config_path, "w", encoding="utf-8") as f:
                 json.dump(config, f, indent=4, ensure_ascii=False)

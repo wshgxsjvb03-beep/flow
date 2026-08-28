@@ -20,6 +20,13 @@ class DownloadThread(QThread):
                 self.urls.append(cleaned)
         self.output_dir = Path(output_dir)
 
+    def stop(self):
+        """Stops the download thread safely."""
+        self.requestInterruption()
+        if self.isRunning():
+            self.quit()
+            self.wait(2000)
+
     def run(self):
         if not self.urls:
             self.finished_signal.emit(False, "未找到任何下载链接。")
@@ -34,6 +41,10 @@ class DownloadThread(QThread):
             total = len(self.urls)
             
             for idx, url in enumerate(self.urls):
+                if self.isInterruptionRequested():
+                    self.status_signal.emit("⛔ 下载已取消")
+                    break
+
                 short_url = url[:40] + "..." if len(url) > 40 else url
                 self.status_signal.emit(f"正在处理第 {idx+1}/{total} 个链接: {short_url}")
                 
@@ -67,17 +78,60 @@ class DownloadThread(QThread):
                 
                 try:
                     if is_folder:
-                        # For folders, use gdown folder downloader
-                        res = gdown.download_folder(
-                            url=url,
-                            output=str(self.output_dir),
-                            quiet=True,
-                            use_cookies=False
-                        )
-                        if res is not None:
-                            success_count += 1
-                        else:
-                            fail_details.append(f"链接 #{idx+1} (文件夹) 下载失败，可能权限未公开。")
+                        # For folders, first try retrieving file list using skip_download=True
+                        folder_success = False
+                        try:
+                            self.status_signal.emit(f"正在获取文件夹内容列表...")
+                            files = gdown.download_folder(
+                                url=url,
+                                output=str(self.output_dir),
+                                quiet=True,
+                                skip_download=True,
+                                use_cookies=False
+                            )
+                            if files is not None and len(files) > 0:
+                                folder_file_count = len(files)
+                                folder_success_count = 0
+                                for f_idx, item in enumerate(files):
+                                    self.status_signal.emit(f"正在下载文件夹文件 ({f_idx+1}/{folder_file_count}): {item.path}")
+                                    target_file = self.output_dir / item.path
+                                    # Direct download first
+                                    success, err_or_name = self._download_file_direct(item.id, target_path=target_file)
+                                    if not success:
+                                        # Fallback to gdown for this file
+                                        res = gdown.download(
+                                            id=item.id,
+                                            output=str(target_file),
+                                            quiet=True,
+                                            fuzzy=True,
+                                            use_cookies=True
+                                        )
+                                        success = bool(res)
+                                    if success:
+                                        folder_success_count += 1
+                                
+                                if folder_success_count == folder_file_count:
+                                    success_count += 1
+                                    folder_success = True
+                                elif folder_success_count > 0:
+                                    success_count += 1
+                                    folder_success = True
+                                    fail_details.append(f"链接 #{idx+1} (文件夹): 部分文件下载失败 ({folder_success_count}/{folder_file_count})。")
+                        except Exception as fe:
+                            self.status_signal.emit(f"解析文件夹元数据失败: {str(fe)}，尝试标准 gdown 模式...")
+                        
+                        if not folder_success:
+                            # Fallback to standard gdown folder downloader
+                            res = gdown.download_folder(
+                                url=url,
+                                output=str(self.output_dir),
+                                quiet=True,
+                                use_cookies=False
+                            )
+                            if res is not None:
+                                success_count += 1
+                            else:
+                                fail_details.append(f"链接 #{idx+1} (文件夹) 下载失败，可能权限未公开。")
                     else:
                         # For files, try direct download using requests first (highly robust)
                         if file_id:
@@ -117,7 +171,7 @@ class DownloadThread(QThread):
             print(f"Download thread error: {err_msg}")
             self.finished_signal.emit(False, f"下载线程异常: {err_msg}")
 
-    def _download_file_direct(self, file_id):
+    def _download_file_direct(self, file_id, target_path=None):
         """Downloads a public Google Drive file directly using requests, bypassing gdown HTML scraping."""
         import requests
         import urllib.parse
@@ -157,30 +211,34 @@ class DownloadThread(QThread):
             if response.status_code != 200:
                 return False, f"HTTP 状态码 {response.status_code}"
                 
-            # Get filename from headers
-            filename = f"file_{file_id}"
-            cd = response.headers.get('Content-Disposition')
-            if cd:
-                # 1. Try RFC 5987 filename* first (URL-encoded UTF-8, most reliable for non-ASCII)
-                fname_star_match = re.findall(r"filename\*=UTF-8''([^;\s]+)", cd)
-                if fname_star_match:
-                    filename = urllib.parse.unquote(fname_star_match[0])
-                else:
-                    # 2. Fallback to standard filename="..." and fix Latin1 decoding issues
-                    fname_match = re.findall(r'filename="([^"]+)"', cd)
-                    if fname_match:
-                        raw_name = fname_match[0]
-                        try:
-                            # Re-decode from latin1 (ISO-8859-1) to UTF-8 to support Chinese characters
-                            filename = raw_name.encode('latin1').decode('utf-8')
-                        except Exception:
-                            filename = raw_name
-                        
-            # Clean and sanitize filename
-            invalid_chars = '<>:"/\\|?*'
-            filename = "".join(c for c in filename if c not in invalid_chars).strip()
-            
-            dest_path = self.output_dir / filename
+            if target_path:
+                dest_path = Path(target_path)
+                dest_path.parent.mkdir(parents=True, exist_ok=True)
+            else:
+                # Get filename from headers
+                filename = f"file_{file_id}"
+                cd = response.headers.get('Content-Disposition')
+                if cd:
+                    # 1. Try RFC 5987 filename* first (URL-encoded UTF-8, most reliable for non-ASCII)
+                    fname_star_match = re.findall(r"filename\*=UTF-8''([^;\s]+)", cd)
+                    if fname_star_match:
+                        filename = urllib.parse.unquote(fname_star_match[0])
+                    else:
+                        # 2. Fallback to standard filename="..." and fix Latin1 decoding issues
+                        fname_match = re.findall(r'filename="([^"]+)"', cd)
+                        if fname_match:
+                            raw_name = fname_match[0]
+                            try:
+                                # Re-decode from latin1 (ISO-8859-1) to UTF-8 to support Chinese characters
+                                filename = raw_name.encode('latin1').decode('utf-8')
+                            except Exception:
+                                filename = raw_name
+                            
+                # Clean and sanitize filename
+                invalid_chars = '<>:"/\\|?*'
+                filename = "".join(c for c in filename if c not in invalid_chars).strip()
+                
+                dest_path = self.output_dir / filename
             
             CHUNK_SIZE = 32768
             with open(dest_path, "wb") as f:
@@ -188,7 +246,8 @@ class DownloadThread(QThread):
                     if chunk:
                         f.write(chunk)
                         
-            return True, filename
+            return True, str(dest_path)
             
         except Exception as e:
             return False, str(e)
+

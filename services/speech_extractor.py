@@ -213,8 +213,23 @@ class SpeechExtractor:
             return {"success": False, "text": "", "error": f"ElevenLabs 提取异常: {str(e)}"}
     
     @staticmethod
+    def _normalize_word_for_compare(word):
+        """Internal helper to clean a word for matching only (ignores punctuation, case, accents).
+        Does NOT modify the original text data.
+        """
+        import re
+        w = word.lower().strip()
+        w = re.sub(r'[^\w]', '', w, flags=re.UNICODE)
+        accent_map = str.maketrans({
+            'á': 'a', 'é': 'e', 'í': 'i', 'ó': 'o', 'ú': 'u', 'ü': 'u',
+            'à': 'a', 'è': 'e', 'ì': 'i', 'ò': 'o', 'ù': 'u',
+        })
+        return w.translate(accent_map)
+
+    @staticmethod
     def calculate_similarity(text1, text2):
-        """Calculates the similarity ratio between two texts.
+        """Calculates the word-level similarity ratio between two texts in-memory,
+        ignoring punctuation, case, and accents. Does not alter any original text data.
         
         Returns:
             float: Similarity score as a percentage (0-100).
@@ -224,11 +239,15 @@ class SpeechExtractor:
         if not text1 or not text2:
             return 0.0
         
-        # Normalize: lowercase, strip extra whitespace
-        t1 = " ".join(text1.lower().split())
-        t2 = " ".join(text2.lower().split())
+        words1 = [SpeechExtractor._normalize_word_for_compare(w) for w in text1.split() if SpeechExtractor._normalize_word_for_compare(w)]
+        words2 = [SpeechExtractor._normalize_word_for_compare(w) for w in text2.split() if SpeechExtractor._normalize_word_for_compare(w)]
         
-        ratio = difflib.SequenceMatcher(None, t1, t2).ratio()
+        if not words1 and not words2:
+            return 100.0
+        if not words1 or not words2:
+            return 0.0
+            
+        ratio = difflib.SequenceMatcher(None, words1, words2).ratio()
         return round(ratio * 100, 1)
     
     @staticmethod
@@ -329,7 +348,15 @@ class ExtractionWorker(QThread):
     def cancel(self):
         """Requests cancellation of the extraction process."""
         self._cancelled = True
+        self.requestInterruption()
     
+    def stop(self):
+        """Stops the worker thread safely."""
+        self.cancel()
+        if self.isRunning():
+            self.quit()
+            self.wait(2000)
+
     def run(self):
         """Main extraction loop - processes segments one by one."""
         total = len(self.segments_to_process)
@@ -340,7 +367,7 @@ class ExtractionWorker(QThread):
         self.config_manager.reset_key_rotation()
         
         for i, seg_info in enumerate(self.segments_to_process):
-            if self._cancelled:
+            if self._cancelled or self.isInterruptionRequested():
                 self.progress.emit(i, total, "⛔ 已取消提取")
                 break
             
