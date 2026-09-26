@@ -252,7 +252,7 @@
         for (const task of tasks) {
             console.log(`[Flow Adapter] Task [Index ${task.index}]: ${task.prompt}`);
 
-            // 1. 如果任务包含图片，自动合成并挂载图片上传
+            // 1. 如果任务包含首帧图片，自动合成并挂载图片上传
             if (task.image_data_url) {
                 const file = dataURLtoFile(task.image_data_url, task.image_name || "upload.png");
                 if (file) {
@@ -260,6 +260,17 @@
                     const uploadInput = document.querySelector('input[type="file"]') || document.querySelector('.file-upload-input');
                     if (uploadInput) {
                         uploadFileToElement(uploadInput, file);
+                    }
+                }
+            }
+
+            // 1.1 如果任务包含尾帧图片，同样支持自动合成挂载上传
+            if (task.end_image_data_url) {
+                const endFile = dataURLtoFile(task.end_image_data_url, task.end_image_name || "end_upload.png");
+                if (endFile) {
+                    const endUploadInput = document.querySelector('.end-frame-upload-input') || document.querySelector('input[type="file"].end-frame');
+                    if (endUploadInput) {
+                        uploadFileToElement(endUploadInput, endFile);
                     }
                 }
             }

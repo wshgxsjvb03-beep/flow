@@ -11,7 +11,7 @@ from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel,
                              QPushButton, QTextEdit, QTableWidget, QTableWidgetItem, 
                              QHeaderView, QTabWidget, QListWidget, QListWidgetItem, 
                              QMessageBox, QSplitter, QLineEdit, QAbstractItemView, 
-                             QToolTip, QComboBox, QFrame, QDialog)
+                             QToolTip, QComboBox, QFrame, QDialog, QCheckBox, QScrollArea)
 from PyQt6.QtCore import Qt, pyqtSlot, QUrl, QTimer, QDateTime
 from PyQt6.QtGui import QDesktopServices, QGuiApplication, QCursor, QPixmap
 from models.project_model import ProjectModel
@@ -36,6 +36,8 @@ class ProjectDetailWidget(QWidget):
         self.is_auto_polling_active = False
         self.polling_timer = None
         self.active_batch_dialog = None
+        self.enable_end_frame = False
+        self.current_prop_row = -1
         self.init_ui()
 
     def set_template_manager(self, tm):
@@ -371,13 +373,19 @@ class ProjectDetailWidget(QWidget):
         
         self.table_splitter.addWidget(self.table_segments)
         
-        # Property Panel Widget
+        # Property Panel Scroll Area
+        self.property_scroll = QScrollArea()
+        self.property_scroll.setWidgetResizable(True)
+        self.property_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.property_scroll.setStyleSheet("QScrollArea { border: none; background-color: #FAF6F0; }")
+        
         self.property_panel = QWidget()
         self.init_property_panel()
-        self.table_splitter.addWidget(self.property_panel)
+        self.property_scroll.setWidget(self.property_panel)
+        self.table_splitter.addWidget(self.property_scroll)
         
         # Set default proportions
-        self.table_splitter.setSizes([680, 220])
+        self.table_splitter.setSizes([640, 260])
         from PyQt6.QtWidgets import QSizePolicy
         self.table_splitter.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         
@@ -531,6 +539,19 @@ class ProjectDetailWidget(QWidget):
         self.txt_spanish.setPlainText(self.project_model.spanish_text)
         self.txt_gdrive_url.setPlainText(self.project_model.google_drive_url)
         
+        # Load end frame setting (project override or global default)
+        if self.project_model.enable_end_frame is not None:
+            self.enable_end_frame = bool(self.project_model.enable_end_frame)
+        else:
+            self.enable_end_frame = bool(getattr(self.config_manager, "enable_end_frame", False)) if self.config_manager else False
+
+        if hasattr(self, "chk_enable_end_frame"):
+            self.chk_enable_end_frame.blockSignals(True)
+            self.chk_enable_end_frame.setChecked(self.enable_end_frame)
+            self.chk_enable_end_frame.blockSignals(False)
+        if hasattr(self, "container_end_image"):
+            self.container_end_image.setVisible(self.enable_end_frame)
+
         # Populate table segments
         self.populate_segments_table()
         
@@ -567,17 +588,26 @@ class ProjectDetailWidget(QWidget):
         self.table_segments.setRowCount(len(segments))
         
         for idx, seg in enumerate(segments):
-            # 智能解析关联图片素材
+            # 智能解析关联首帧图片素材
             img_name, _, _ = self.resolve_segment_image_and_data(idx, seg)
             if img_name:
                 seg["image_name"] = img_name
 
-            # 0. Index & Icons (📷: has image, ⚙️: has custom template/motion)
+            # 智能解析关联尾帧图片素材（若启用）
+            if getattr(self, "enable_end_frame", False):
+                end_img_name, _, _ = self.resolve_segment_end_image_and_data(idx, seg)
+                if end_img_name:
+                    seg["end_image_name"] = end_img_name
+
+            # 0. Index & Icons (📷: 首帧图片, 🎬: 尾帧图片, ⚙️: 自定义模板/运镜)
             has_image = bool(seg.get("image_name"))
+            has_end_image = bool(seg.get("end_image_name")) if getattr(self, "enable_end_frame", False) else False
             has_custom = bool(seg.get("template_id")) or bool(seg.get("motion_id"))
             idx_text = str(idx + 1)
             if has_image:
                 idx_text += " 📷"
+            if has_end_image:
+                idx_text += " 🎬"
             if has_custom:
                 idx_text += " ⚙️"
             self.table_segments.setItem(idx, 0, QTableWidgetItem(idx_text))
@@ -808,6 +838,7 @@ class ProjectDetailWidget(QWidget):
                 "length": 0,
                 "duration": 6,
                 "image_name": single_img if single_img else "",
+                "end_image_name": "",
                 "mode": "VIDEO_FRAMES"
             })
 
@@ -967,13 +998,7 @@ class ProjectDetailWidget(QWidget):
         # Recalculate IDs
         self.table_segments.blockSignals(True)
         for idx in range(self.table_segments.rowCount()):
-            # Recalculate with 📷 emoji if it has an image
-            has_image = False
-            if self.project_model and idx < len(self.project_model.spanish_segments):
-                has_image = bool(self.project_model.spanish_segments[idx].get("image_name"))
-            idx_text = f"{idx + 1} 📷" if has_image else str(idx + 1)
-            self.table_segments.setItem(idx, 0, QTableWidgetItem(idx_text))
-            self.table_segments.item(idx, 0).setFlags(Qt.ItemFlag.ItemIsEnabled)
+            self.refresh_table_row_index_label(idx)
         self.table_segments.blockSignals(False)
 
     def run_segmentation(self):
@@ -1025,6 +1050,7 @@ class ProjectDetailWidget(QWidget):
                     "length": len(text),
                     "duration": duration,
                     "image_name": "",
+                    "end_image_name": "",
                     "mode": "VIDEO_FRAMES"
                 })
                 
@@ -1255,10 +1281,19 @@ class ProjectDetailWidget(QWidget):
         panel_layout.setContentsMargins(10, 0, 10, 0)
         panel_layout.setSpacing(10)
         
-        # Title
+        # Title and End Frame Toggle Row
+        title_row = QHBoxLayout()
         lbl_title = QLabel("⚙️ 片段属性配置")
         lbl_title.setStyleSheet("font-size: 14px; font-weight: bold; color: #5D4037;")
-        panel_layout.addWidget(lbl_title)
+        title_row.addWidget(lbl_title)
+        title_row.addStretch()
+        
+        self.chk_enable_end_frame = QCheckBox("启用尾帧")
+        self.chk_enable_end_frame.setToolTip("开启后，支持为每句配置尾帧，并将尾帧自动联动为下一句的首帧。")
+        self.chk_enable_end_frame.setStyleSheet("font-size: 12px; color: #5D4037; font-weight: bold;")
+        self.chk_enable_end_frame.toggled.connect(self.on_enable_end_frame_toggled)
+        title_row.addWidget(self.chk_enable_end_frame)
+        panel_layout.addLayout(title_row)
         
         # Separator line
         line = QFrame()
@@ -1285,8 +1320,9 @@ class ProjectDetailWidget(QWidget):
         """)
         panel_layout.addWidget(self.txt_prop_text)
         
-        # Image selector
-        panel_layout.addWidget(QLabel("📸 关联图片素材:"))
+        # 1. First Image selector
+        self.lbl_prop_first_image = QLabel("📸 首帧图片素材:")
+        panel_layout.addWidget(self.lbl_prop_first_image)
         self.combo_prop_image = QComboBox()
         self.combo_prop_image.setMaxVisibleItems(15)
         self.combo_prop_image.view().setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
@@ -1308,8 +1344,8 @@ class ProjectDetailWidget(QWidget):
         self.combo_prop_image.currentIndexChanged.connect(self.on_prop_image_changed)
         panel_layout.addWidget(self.combo_prop_image)
         
-        # Image preview
-        self.lbl_prop_preview = QLabel("无图片预览")
+        # First Image preview
+        self.lbl_prop_preview = QLabel("无首帧预览")
         self.lbl_prop_preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.lbl_prop_preview.setMinimumHeight(120)
         self.lbl_prop_preview.setMaximumHeight(160)
@@ -1324,6 +1360,55 @@ class ProjectDetailWidget(QWidget):
             }
         """)
         panel_layout.addWidget(self.lbl_prop_preview)
+        
+        # 2. End Image selector & preview (in togglable container)
+        self.container_end_image = QWidget()
+        end_img_layout = QVBoxLayout(self.container_end_image)
+        end_img_layout.setContentsMargins(0, 0, 0, 0)
+        end_img_layout.setSpacing(6)
+        
+        self.lbl_prop_end_image = QLabel("🎬 尾帧图片素材 (下一句首帧自动跟随):")
+        end_img_layout.addWidget(self.lbl_prop_end_image)
+        
+        self.combo_prop_end_image = QComboBox()
+        self.combo_prop_end_image.setMaxVisibleItems(15)
+        self.combo_prop_end_image.view().setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.combo_prop_end_image.setStyleSheet("""
+            QComboBox {
+                background-color: white;
+                border: 1px solid #D7CCC8;
+                border-radius: 4px;
+                padding: 4px 8px;
+            }
+            QComboBox QAbstractItemView {
+                border: 1px solid #D7CCC8;
+                background-color: white;
+                selection-background-color: #FFE0B2;
+                selection-color: #5D4037;
+                outline: none;
+            }
+        """)
+        self.combo_prop_end_image.currentIndexChanged.connect(self.on_prop_end_image_changed)
+        end_img_layout.addWidget(self.combo_prop_end_image)
+        
+        self.lbl_prop_end_preview = QLabel("无尾帧预览")
+        self.lbl_prop_end_preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.lbl_prop_end_preview.setMinimumHeight(120)
+        self.lbl_prop_end_preview.setMaximumHeight(160)
+        self.lbl_prop_end_preview.setStyleSheet("""
+            QLabel {
+                background-color: #EFEBE9;
+                border: 1px solid #D7CCC8;
+                border-radius: 4px;
+                color: #8D6E63;
+                font-size: 11px;
+                font-weight: normal;
+            }
+        """)
+        end_img_layout.addWidget(self.lbl_prop_end_preview)
+        
+        panel_layout.addWidget(self.container_end_image)
+        self.container_end_image.setVisible(self.enable_end_frame)
         
         # Segment-specific template selector
         panel_layout.addWidget(QLabel("📐 片段专属模板:"))
@@ -1383,6 +1468,18 @@ class ProjectDetailWidget(QWidget):
         
         # Disable properties by default until a row is selected
         self.property_panel.setEnabled(False)
+
+    def on_enable_end_frame_toggled(self, checked):
+        """Toggles end frame capability for current project."""
+        self.enable_end_frame = checked
+        if self.project_model:
+            self.project_model.enable_end_frame = checked
+            self.project_model.save()
+        if hasattr(self, "container_end_image"):
+            self.container_end_image.setVisible(checked)
+        # Refresh all row index labels in table to update 🎬 emojis
+        for r in range(self.table_segments.rowCount()):
+            self.refresh_table_row_index_label(r)
 
     def resolve_segment_image_and_data(self, idx, seg):
         """
@@ -1468,6 +1565,47 @@ class ProjectDetailWidget(QWidget):
 
         return chosen_name, chosen_path, data_url
 
+    def resolve_segment_end_image_and_data(self, idx, seg):
+        """
+        解析分句关联的尾帧图片文件名、绝对路径以及 Base64 Data URL：
+        1. 仅当启用尾帧功能时生效；
+        2. 检查 seg 中显式绑定的 end_image_name 是否真实存在于 downloads/；
+        3. 若存在，自动读取并编码为 base64 data url；
+        4. 若未开启或未指定，返回 ("", "", "")。
+        """
+        if not getattr(self, "enable_end_frame", False) or not self.project_path:
+            return "", "", ""
+
+        downloads_dir = self.project_path / "downloads"
+        if not downloads_dir.exists():
+            return "", "", ""
+
+        end_name = seg.get("end_image_name", "").strip() if isinstance(seg, dict) else ""
+        if not end_name:
+            return "", "", ""
+
+        cand = downloads_dir / end_name
+        if not cand.exists() or not cand.is_file():
+            return "", "", ""
+
+        end_path = str(cand.resolve())
+
+        import base64
+        import mimetypes
+        mime_type, _ = mimetypes.guess_type(end_path)
+        if not mime_type:
+            mime_type = "image/png"
+
+        data_url = ""
+        try:
+            with open(cand, "rb") as f:
+                b64_str = base64.b64encode(f.read()).decode("utf-8")
+                data_url = f"data:{mime_type};base64,{b64_str}"
+        except Exception as e:
+            logger.warning(f"读取尾帧图片 Base64 失败 [{end_name}]: {e}")
+
+        return end_name, end_path, data_url
+
     def get_project_single_image(self):
         """Returns the filename of the single image in downloads directory, or None if 0 or >1 images."""
         if not self.project_path:
@@ -1492,6 +1630,13 @@ class ProjectDetailWidget(QWidget):
             self.combo_prop_image.blockSignals(True)
             self.combo_prop_image.setCurrentIndex(0)
             self.combo_prop_image.blockSignals(False)
+            if hasattr(self, "combo_prop_end_image"):
+                self.combo_prop_end_image.blockSignals(True)
+                self.combo_prop_end_image.setCurrentIndex(0)
+                self.combo_prop_end_image.blockSignals(False)
+            if hasattr(self, "lbl_prop_end_preview"):
+                self.lbl_prop_end_preview.clear()
+                self.lbl_prop_end_preview.setText("无尾帧预览")
             self.combo_prop_template.blockSignals(True)
             self.combo_prop_template.setCurrentIndex(0)
             self.combo_prop_template.blockSignals(False)
@@ -1499,7 +1644,7 @@ class ProjectDetailWidget(QWidget):
             self.combo_prop_motion.setCurrentIndex(0)
             self.combo_prop_motion.blockSignals(False)
             self.lbl_prop_preview.clear()
-            self.lbl_prop_preview.setText("无图片预览")
+            self.lbl_prop_preview.setText("无首帧预览")
             self.combo_prop_mode.blockSignals(True)
             self.combo_prop_mode.setCurrentIndex(0)
             self.combo_prop_mode.blockSignals(False)
@@ -1517,6 +1662,8 @@ class ProjectDetailWidget(QWidget):
         
         # Block signals to prevent infinite update loop
         self.combo_prop_image.blockSignals(True)
+        if hasattr(self, "combo_prop_end_image"):
+            self.combo_prop_end_image.blockSignals(True)
         self.combo_prop_template.blockSignals(True)
         self.combo_prop_motion.blockSignals(True)
         self.combo_prop_mode.blockSignals(True)
@@ -1530,13 +1677,22 @@ class ProjectDetailWidget(QWidget):
         self.refresh_prop_image_combo_items()
         self.refresh_prop_template_motion_combos()
         
-        # Select current image
+        # Select current image (首帧)
         image_name = seg.get("image_name", "")
         img_idx = self.combo_prop_image.findData(image_name)
         if img_idx >= 0:
             self.combo_prop_image.setCurrentIndex(img_idx)
         else:
             self.combo_prop_image.setCurrentIndex(0)
+
+        # Select current end image (尾帧)
+        end_image_name = seg.get("end_image_name", "")
+        if hasattr(self, "combo_prop_end_image"):
+            end_img_idx = self.combo_prop_end_image.findData(end_image_name)
+            if end_img_idx >= 0:
+                self.combo_prop_end_image.setCurrentIndex(end_img_idx)
+            else:
+                self.combo_prop_end_image.setCurrentIndex(0)
 
         # Select current segment template
         seg_tpl_id = seg.get("template_id", "")
@@ -1564,18 +1720,30 @@ class ProjectDetailWidget(QWidget):
             
         # Update preview
         self.update_prop_image_preview(image_name)
+        if hasattr(self, "update_prop_end_image_preview"):
+            self.update_prop_end_image_preview(end_image_name)
         
         self.combo_prop_image.blockSignals(False)
+        if hasattr(self, "combo_prop_end_image"):
+            self.combo_prop_end_image.blockSignals(False)
         self.combo_prop_template.blockSignals(False)
         self.combo_prop_motion.blockSignals(False)
         self.combo_prop_mode.blockSignals(False)
 
     def refresh_prop_image_combo_items(self):
         self.combo_prop_image.blockSignals(True)
+        if hasattr(self, "combo_prop_end_image"):
+            self.combo_prop_end_image.blockSignals(True)
+            
         current_data = self.combo_prop_image.currentData()
+        current_end_data = self.combo_prop_end_image.currentData() if hasattr(self, "combo_prop_end_image") else None
         
         self.combo_prop_image.clear()
-        self.combo_prop_image.addItem("-- 无图片 --", "")
+        self.combo_prop_image.addItem("-- 无首帧 --", "")
+        
+        if hasattr(self, "combo_prop_end_image"):
+            self.combo_prop_end_image.clear()
+            self.combo_prop_end_image.addItem("-- 无尾帧 --", "")
         
         if self.project_path:
             downloads_dir = self.project_path / "downloads"
@@ -1587,13 +1755,22 @@ class ProjectDetailWidget(QWidget):
                         # Add item with a small icon preview!
                         icon = self.get_small_image_icon(item)
                         self.combo_prop_image.addItem(icon, item.name, item.name)
+                        if hasattr(self, "combo_prop_end_image"):
+                            self.combo_prop_end_image.addItem(icon, item.name, item.name)
                         
         # Restore index if it was previously set
         if current_data:
             idx = self.combo_prop_image.findData(current_data)
             if idx >= 0:
                 self.combo_prop_image.setCurrentIndex(idx)
+        if current_end_data and hasattr(self, "combo_prop_end_image"):
+            idx_end = self.combo_prop_end_image.findData(current_end_data)
+            if idx_end >= 0:
+                self.combo_prop_end_image.setCurrentIndex(idx_end)
+                
         self.combo_prop_image.blockSignals(False)
+        if hasattr(self, "combo_prop_end_image"):
+            self.combo_prop_end_image.blockSignals(False)
 
     def get_small_image_icon(self, file_path):
         from PyQt6.QtGui import QIcon, QImage, QPixmap
@@ -1614,7 +1791,7 @@ class ProjectDetailWidget(QWidget):
     def update_prop_image_preview(self, image_name):
         if not image_name:
             self.lbl_prop_preview.clear()
-            self.lbl_prop_preview.setText("无图片")
+            self.lbl_prop_preview.setText("无首帧")
             return
             
         file_path = self.project_path / "downloads" / image_name
@@ -1639,6 +1816,36 @@ class ProjectDetailWidget(QWidget):
             self.lbl_prop_preview.clear()
             self.lbl_prop_preview.setText("预览失败")
 
+    def update_prop_end_image_preview(self, image_name):
+        if not hasattr(self, "lbl_prop_end_preview"):
+            return
+        if not image_name:
+            self.lbl_prop_end_preview.clear()
+            self.lbl_prop_end_preview.setText("无尾帧")
+            return
+            
+        file_path = self.project_path / "downloads" / image_name
+        if not file_path.exists():
+            self.lbl_prop_end_preview.clear()
+            self.lbl_prop_end_preview.setText("图片不存在")
+            return
+            
+        try:
+            from PIL import Image
+            from PyQt6.QtGui import QImage, QPixmap
+            pil_img = Image.open(file_path)
+            pil_img.thumbnail((220, 150))
+            pil_img_rgba = pil_img.convert("RGBA")
+            width, height = pil_img_rgba.size
+            raw_data = pil_img_rgba.tobytes("raw", "RGBA")
+            qimg = QImage(raw_data, width, height, QImage.Format.Format_RGBA8888).copy()
+            pixmap = QPixmap.fromImage(qimg)
+            self.lbl_prop_end_preview.setPixmap(pixmap)
+        except Exception as e:
+            print(f"Error loading end preview: {e}")
+            self.lbl_prop_end_preview.clear()
+            self.lbl_prop_end_preview.setText("预览失败")
+
     def on_prop_image_changed(self):
         row = getattr(self, "current_prop_row", -1)
         if row < 0 or not self.project_model or row >= len(self.project_model.spanish_segments):
@@ -1653,6 +1860,29 @@ class ProjectDetailWidget(QWidget):
         # Refresh the index cell text to display the camera emoji if selected
         self.refresh_table_row_index_label(row)
 
+    def on_prop_end_image_changed(self):
+        row = getattr(self, "current_prop_row", -1)
+        if row < 0 or not self.project_model or row >= len(self.project_model.spanish_segments):
+            return
+            
+        end_image_name = self.combo_prop_end_image.currentData() if hasattr(self, "combo_prop_end_image") else ""
+        self.project_model.spanish_segments[row]["end_image_name"] = end_image_name if end_image_name else ""
+        
+        # Update large preview
+        self.update_prop_end_image_preview(end_image_name)
+        
+        # 联动逻辑：若当前启用了尾帧，且当前句设置了有效的尾帧图片，
+        # 则自动将下一句（第 row + 2 句）的首帧设置为该尾帧图片！
+        if getattr(self, "enable_end_frame", False) and end_image_name:
+            next_row = row + 1
+            if next_row < len(self.project_model.spanish_segments):
+                self.project_model.spanish_segments[next_row]["image_name"] = end_image_name
+                self.refresh_table_row_index_label(next_row)
+                
+        # 刷新当前行图标与保存
+        self.refresh_table_row_index_label(row)
+        self.project_model.save()
+
     def on_prop_mode_changed(self):
         row = getattr(self, "current_prop_row", -1)
         if row < 0 or not self.project_model or row >= len(self.project_model.spanish_segments):
@@ -1666,10 +1896,13 @@ class ProjectDetailWidget(QWidget):
             return
         seg = self.project_model.spanish_segments[row]
         has_image = bool(seg.get("image_name"))
+        has_end_image = bool(seg.get("end_image_name")) if getattr(self, "enable_end_frame", False) else False
         has_custom = bool(seg.get("template_id")) or bool(seg.get("motion_id"))
         index_label = str(row + 1)
         if has_image:
             index_label += " 📷"
+        if has_end_image:
+            index_label += " 🎬"
         if has_custom:
             index_label += " ⚙️"
         
@@ -1905,7 +2138,9 @@ class ProjectDetailWidget(QWidget):
             download_name = f"{idx+1:02d}.mp4"
             download_path = str((videos_dir / download_name).resolve())
             
-            all_tasks.append({
+            end_image_name, end_local_image_path, _ = self.resolve_segment_end_image_and_data(idx, seg)
+
+            task_dict = {
                 "prompt": final_prompt,
                 "mode": mode,
                 "image_name": image_name,
@@ -1915,7 +2150,12 @@ class ProjectDetailWidget(QWidget):
                 "_raw_duration": duration,
                 "_original_index": idx,
                 "_text_len": len(text)
-            })
+            }
+            if getattr(self, "enable_end_frame", False) and end_image_name:
+                task_dict["end_image_name"] = end_image_name
+                task_dict["end_local_image_path"] = end_local_image_path
+
+            all_tasks.append(task_dict)
 
         if not all_tasks:
             if skipped_copied_count > 0:
@@ -2362,6 +2602,7 @@ class ProjectDetailWidget(QWidget):
             final_prompt = re.sub(r' +', ' ', final_prompt).strip()
             
             image_name, local_image_path, image_data_url = self.resolve_segment_image_and_data(idx, seg)
+            end_image_name, end_local_image_path, end_image_data_url = self.resolve_segment_end_image_and_data(idx, seg)
             mode = seg.get("mode", "VIDEO_FRAMES")
             duration = seg.get("duration", 6)
                 
@@ -2369,7 +2610,7 @@ class ProjectDetailWidget(QWidget):
             download_name = f"{idx+1:02d}.mp4"
             download_path = str((videos_dir / download_name).resolve())
             
-            all_unprocessed_tasks.append({
+            task_dict = {
                 "index": idx,
                 "prompt": final_prompt,
                 "mode": mode,
@@ -2382,7 +2623,14 @@ class ProjectDetailWidget(QWidget):
                 "_raw_duration": duration,
                 "_original_index": idx,
                 "_text_len": len(text)
-            })
+            }
+            if getattr(self, "enable_end_frame", False) and end_image_name:
+                task_dict["end_image_name"] = end_image_name
+                task_dict["end_local_image_path"] = end_local_image_path
+                task_dict["end_image_data_url"] = end_image_data_url
+                task_dict["endImageDataUrl"] = end_image_data_url
+
+            all_unprocessed_tasks.append(task_dict)
 
         if not all_unprocessed_tasks or capacity_points < 7:
             return []
@@ -2570,7 +2818,7 @@ class BatchExportDialog(QDialog):
         self.skipped_count = skipped_count
         max_pts = self.cm.max_batch_points if self.cm else 50
         self.setWindowTitle(f"分批生成与多浏览器调度 (最高{max_pts}积分/批)")
-        self.resize(620, 520)
+        self.resize(780, 580)
         self.batches = batches  # List of lists of dicts
         self.copied_batches = set()
         self.init_ui()
@@ -2588,17 +2836,74 @@ class BatchExportDialog(QDialog):
         # Summary Label
         total_segments = sum(len(b) for b in self.batches)
         total_points = sum(self.get_batch_points(b) for b in self.batches)
+        total_end_frames = sum(sum(1 for t in b if t.get("end_image_name")) for b in self.batches)
         max_pts = self.cm.max_batch_points if self.cm else 50
         
         skipped_text = f" <span style='color: #10B981;'>(已自动排除 {self.skipped_count} 个已生成的变绿片段)</span>" if self.skipped_count > 0 else ""
+        end_stat_text = f" | 🎬 包含 <b>{total_end_frames}</b> 个配置尾帧的分句" if total_end_frames > 0 else ""
         
         lbl_summary = QLabel(
-            f"📊 <b>统计信息</b>：共 <b>{total_segments}</b> 个待生成视频片段{skipped_text}，"
+            f"📊 <b>统计信息</b>：共 <b>{total_segments}</b> 个待生成视频片段{skipped_text}{end_stat_text}，"
             f"总需 <b>{total_points}</b> 积分。<br/>"
             f"每批次上限为 <b>{max_pts}</b> 积分，已拆为 <b>{len(self.batches)}</b> 个批次。"
         )
         lbl_summary.setStyleSheet("font-size: 13px; color: #5D4037;")
         layout.addWidget(lbl_summary)
+
+        # Quick actions bar for plugin table integration
+        quick_bar = QHBoxLayout()
+        quick_bar.setSpacing(8)
+        
+        lbl_quick_hint = QLabel("💡 插件表格对接：")
+        lbl_quick_hint.setStyleSheet("font-size: 12px; color: #78350F; font-weight: bold;")
+        quick_bar.addWidget(lbl_quick_hint)
+        
+        btn_copy_all_end = QPushButton(f"🎬 复制全部待生成尾帧列 (共 {total_segments} 行)")
+        btn_copy_all_end.setToolTip(
+            f"将所有待生成的 {total_segments} 个分句尾帧按顺序整理为多行文本。\n"
+            "在插件表格第1行的【尾帧图片名】单元格按 Ctrl+V 即可整列全部填满！"
+        )
+        btn_copy_all_end.setStyleSheet("""
+            QPushButton {
+                background-color: #D97706;
+                color: white;
+                border: none;
+                border-radius: 4px;
+                padding: 6px 12px;
+                font-size: 11px;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background-color: #B45309;
+            }
+        """)
+        btn_copy_all_end.clicked.connect(lambda: self.copy_all_end_frames(btn_copy_all_end))
+        quick_bar.addWidget(btn_copy_all_end)
+
+        btn_copy_all_tsv = QPushButton(f"📊 复制全部表格数据 (TSV格式)")
+        btn_copy_all_tsv.setToolTip(
+            "按 [序号 \\t 首帧图名 \\t 尾帧图名 \\t 分镜名] 复制全部待生成数据。\n"
+            "适用于支持多列批量粘贴的场景或 Excel 表格整理。"
+        )
+        btn_copy_all_tsv.setStyleSheet("""
+            QPushButton {
+                background-color: #0284C7;
+                color: white;
+                border: none;
+                border-radius: 4px;
+                padding: 6px 12px;
+                font-size: 11px;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background-color: #0369A1;
+            }
+        """)
+        btn_copy_all_tsv.clicked.connect(lambda: self.copy_all_tsv(btn_copy_all_tsv))
+        quick_bar.addWidget(btn_copy_all_tsv)
+
+        quick_bar.addStretch()
+        layout.addLayout(quick_bar)
         
         # Scrollable area of batches
         self.list_batches = QListWidget()
@@ -2615,20 +2920,27 @@ class BatchExportDialog(QDialog):
             
             widget = QWidget()
             widget_layout = QHBoxLayout(widget)
-            widget_layout.setContentsMargins(10, 8, 10, 8)
+            widget_layout.setContentsMargins(12, 10, 12, 10)
             
             points = self.get_batch_points(batch)
             indices_str = ", ".join(str(t["_original_index"] + 1) for t in batch)
+            batch_end_count = sum(1 for t in batch if t.get("end_image_name"))
+            end_badge = f" | 🎬 尾帧: <b>{batch_end_count}</b> 个" if batch_end_count > 0 else ""
             
             info_text = (
-                f"<b>第 {idx + 1} 批</b> (序号: {indices_str})<br/>"
-                f"📎 包含 {len(batch)} 个分句 | ⚡ 消耗 <b>{points}</b> 积分"
+                f"<b>第 {idx + 1} 批</b> (分镜序号: {indices_str})<br/>"
+                f"📎 包含 {len(batch)} 个分句{end_badge} | ⚡ 消耗 <b>{points}</b> 积分"
             )
             lbl_info = QLabel(info_text)
             lbl_info.setStyleSheet("font-size: 12px; color: #5D4037;")
             widget_layout.addWidget(lbl_info, stretch=1)
             
-            btn_copy = QPushButton("📋 复制本批任务")
+            # Action buttons for this batch
+            btns_layout = QHBoxLayout()
+            btns_layout.setSpacing(6)
+            
+            btn_copy = QPushButton("📋 复制任务 JSON")
+            btn_copy.setToolTip("复制本批次完整的 JSON 任务数据（包含提示词、时长、模式等），供插件导入")
             btn_copy.setStyleSheet("""
                 QPushButton {
                     background-color: #8B5CF6;
@@ -2644,8 +2956,50 @@ class BatchExportDialog(QDialog):
                 }
             """)
             btn_copy.clicked.connect(self.make_copy_callback(idx, btn_copy))
-            widget_layout.addWidget(btn_copy)
+            btns_layout.addWidget(btn_copy)
             
+            btn_copy_end = QPushButton("🎬 复制尾帧列")
+            btn_copy_end.setToolTip(
+                f"按本批分镜顺序将 {len(batch)} 行尾帧图片名复制为多行文本。\n"
+                "在插件表格第1行【尾帧图片名】按 Ctrl+V 即可整列填满！"
+            )
+            btn_copy_end.setStyleSheet("""
+                QPushButton {
+                    background-color: #F59E0B;
+                    color: white;
+                    border: none;
+                    border-radius: 4px;
+                    padding: 6px 10px;
+                    font-size: 11px;
+                    font-weight: bold;
+                }
+                QPushButton:hover {
+                    background-color: #D97706;
+                }
+            """)
+            btn_copy_end.clicked.connect(self.make_copy_end_callback(idx, btn_copy_end))
+            btns_layout.addWidget(btn_copy_end)
+
+            btn_copy_tsv = QPushButton("📊 表格TSV")
+            btn_copy_tsv.setToolTip(f"按 [序号 \\t 首帧图名 \\t 尾帧图名 \\t 分镜名] 复制本批 {len(batch)} 行制表符数据")
+            btn_copy_tsv.setStyleSheet("""
+                QPushButton {
+                    background-color: #0284C7;
+                    color: white;
+                    border: none;
+                    border-radius: 4px;
+                    padding: 6px 10px;
+                    font-size: 11px;
+                    font-weight: bold;
+                }
+                QPushButton:hover {
+                    background-color: #0369A1;
+                }
+            """)
+            btn_copy_tsv.clicked.connect(self.make_copy_tsv_callback(idx, btn_copy_tsv))
+            btns_layout.addWidget(btn_copy_tsv)
+            
+            widget_layout.addLayout(btns_layout)
             widget.setLayout(widget_layout)
             item.setSizeHint(widget.sizeHint())
             self.list_batches.setItemWidget(item, widget)
@@ -2654,7 +3008,7 @@ class BatchExportDialog(QDialog):
         
         # Close Button
         btn_close = QPushButton("关闭")
-        btn_close.setStyleSheet("background-color: #E0A96D; color: white; padding: 6px; font-weight: bold; border-radius: 4px;")
+        btn_close.setStyleSheet("background-color: #E0A96D; color: white; padding: 7px; font-weight: bold; border-radius: 4px;")
         btn_close.clicked.connect(self.accept)
         layout.addWidget(btn_close)
 
@@ -2678,7 +3032,13 @@ class BatchExportDialog(QDialog):
         
     def make_copy_callback(self, batch_idx, button):
         return lambda: self.copy_batch(batch_idx, button)
-        
+
+    def make_copy_end_callback(self, batch_idx, button):
+        return lambda: self.copy_end_frames_column(self.batches[batch_idx], button, desc=f"第 {batch_idx + 1} 批")
+
+    def make_copy_tsv_callback(self, batch_idx, button):
+        return lambda: self.copy_tsv_table(self.batches[batch_idx], button, desc=f"第 {batch_idx + 1} 批")
+
     def copy_batch(self, batch_idx, button):
         import json
         batch_data = self.batches[batch_idx]
@@ -2710,4 +3070,81 @@ class BatchExportDialog(QDialog):
         except Exception as e:
             from PyQt6.QtWidgets import QMessageBox
             QMessageBox.critical(self, "错误", f"复制批次失败: {e}")
+
+    def copy_end_frames_column(self, batch_data, button, desc="本批"):
+        """Copies newline-delimited end frame image names strictly aligned with batch tasks."""
+        end_names = [item.get("end_image_name", "").strip() for item in batch_data]
+        text_to_copy = "\n".join(end_names)
+        
+        try:
+            from PyQt6.QtGui import QGuiApplication, QCursor
+            from PyQt6.QtWidgets import QToolTip, QMessageBox
+            clipboard = QGuiApplication.clipboard()
+            clipboard.setText(text_to_copy)
+            
+            button.setText("✓ 已复制尾帧列")
+            button.setStyleSheet("""
+                QPushButton {
+                    background-color: #059669;
+                    color: white;
+                    border: none;
+                    border-radius: 4px;
+                    padding: 6px 10px;
+                    font-size: 11px;
+                    font-weight: bold;
+                }
+            """)
+            has_end = sum(1 for n in end_names if n)
+            msg = f"✓ 已复制{desc} {len(end_names)} 行尾帧名（含 {has_end} 个已设置尾帧）！\n请切换到插件端，在表格【尾帧图片名】首行单元格按 Ctrl+V 即可整列粘贴。"
+            QToolTip.showText(QCursor.pos(), msg, button)
+        except Exception as e:
+            from PyQt6.QtWidgets import QMessageBox
+            QMessageBox.critical(self, "错误", f"复制尾帧列失败: {e}")
+
+    def copy_tsv_table(self, batch_data, button, desc="本批"):
+        """Copies TSV formatted rows matching the plugin table structure."""
+        tsv_lines = []
+        for idx, item in enumerate(batch_data):
+            orig_idx = item.get("_original_index", idx) + 1
+            first_img = item.get("image_name", "").strip()
+            end_img = item.get("end_image_name", "").strip()
+            dl_path = item.get("download_path", "")
+            dl_name = Path(dl_path).name if dl_path else f"{orig_idx:02d}.mp4"
+            
+            # Format matching plugin: 序号 \t 素材图/首帧-图片名 \t 尾帧图片名 \t 分镜片段名称
+            line = f"{orig_idx}\t{first_img}\t{end_img}\t{dl_name}"
+            tsv_lines.append(line)
+            
+        tsv_text = "\n".join(tsv_lines)
+        try:
+            from PyQt6.QtGui import QGuiApplication, QCursor
+            from PyQt6.QtWidgets import QToolTip, QMessageBox
+            clipboard = QGuiApplication.clipboard()
+            clipboard.setText(tsv_text)
+            
+            button.setText("✓ 已复制TSV")
+            button.setStyleSheet("""
+                QPushButton {
+                    background-color: #0284C7;
+                    color: white;
+                    border: none;
+                    border-radius: 4px;
+                    padding: 6px 10px;
+                    font-size: 11px;
+                    font-weight: bold;
+                }
+            """)
+            msg = f"✓ 已复制{desc} {len(tsv_lines)} 行 TSV 表格数据！\n格式：[序号 \\t 首帧图名 \\t 尾帧图名 \\t 分镜名]\n支持在 Excel 或插件表格中批量粘贴。"
+            QToolTip.showText(QCursor.pos(), msg, button)
+        except Exception as e:
+            from PyQt6.QtWidgets import QMessageBox
+            QMessageBox.critical(self, "错误", f"复制TSV表格失败: {e}")
+
+    def copy_all_end_frames(self, button):
+        all_tasks = [task for batch in self.batches for task in batch]
+        self.copy_end_frames_column(all_tasks, button, desc="全部")
+
+    def copy_all_tsv(self, button):
+        all_tasks = [task for batch in self.batches for task in batch]
+        self.copy_tsv_table(all_tasks, button, desc="全部")
 

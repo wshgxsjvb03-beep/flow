@@ -25,6 +25,7 @@ class ProjectModel:
         self.prompt_template = ""
         self.selected_template_id = ""
         self.selected_motion_id = ""
+        self.enable_end_frame = None  # None: follow config, True/False: explicit project override
         
         # Load existing metadata if available
         self.load()
@@ -47,6 +48,7 @@ class ProjectModel:
                     self.prompt_template = data.get("prompt_template", self.prompt_template)
                     self.selected_template_id = data.get("selected_template_id", "")
                     self.selected_motion_id = data.get("selected_motion_id", "")
+                    self.enable_end_frame = data.get("enable_end_frame", None)
                 
                 # Proactively ensure subtitle file exists
                 subtitles_dir = self.project_dir.parent / "字幕"
@@ -72,6 +74,8 @@ class ProjectModel:
             "selected_template_id": self.selected_template_id,
             "selected_motion_id": self.selected_motion_id
         }
+        if self.enable_end_frame is not None:
+            data["enable_end_frame"] = self.enable_end_frame
         try:
             with open(self.metadata_path, "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=4, ensure_ascii=False)

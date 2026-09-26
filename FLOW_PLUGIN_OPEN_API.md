@@ -196,7 +196,8 @@
 | 字段名 | 类型 | 必填 | 默认值 | 说明 |
 | :--- | :--- | :--- | :--- | :--- |
 | `prompt` | `string` | 是 | - | 视频生成提示词文本 |
-| `image_name` | `string` | 否 | `""` | 关联素材图片名称 (用于比对匹配) |
+| `image_name` | `string` | 否 | `""` | 关联首帧素材图片名称 (用于比对匹配) |
+| `end_image_name` | `string` | 否 | `""` | 关联尾帧素材图片名称 (若启用尾帧) |
 | `media_key` | `string` | 否 | `""` | 显式指定的图片素材 `media_key` (若提供则无需匹配) |
 | `duration` | `integer` | 否 | `6` | 视频时长，单位秒 (支持 `4`, `6`, `8`, `10`) |
 | `mode` | `string` | 否 | `"VIDEO_FRAMES"` | 生成模式：`"VIDEO_FRAMES"` (首尾帧) 或 `"VIDEO_REFERENCES"` (参考素材) |

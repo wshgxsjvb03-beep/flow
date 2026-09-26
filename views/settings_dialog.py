@@ -2,7 +2,8 @@
 from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QPushButton, 
                              QLabel, QSpinBox, QTableWidget, QTableWidgetItem, 
                              QHeaderView, QMessageBox, QGroupBox, QAbstractItemView, 
-                             QLineEdit, QComboBox, QTextEdit, QScrollArea, QWidget)
+                             QLineEdit, QComboBox, QTextEdit, QScrollArea, QWidget,
+                             QCheckBox)
 from PyQt6.QtCore import Qt
 
 class SettingsDialog(QDialog):
@@ -233,6 +234,23 @@ class SettingsDialog(QDialog):
         
         main_layout.addWidget(group_api)
         
+        # Section 5: End Frame Settings
+        group_end_frame = QGroupBox("5. 视频首尾帧联动设置 (First & End Frame Settings)")
+        end_frame_layout = QVBoxLayout(group_end_frame)
+        end_frame_layout.setContentsMargins(12, 12, 12, 12)
+        end_frame_layout.setSpacing(6)
+        
+        self.chk_default_enable_end_frame = QCheckBox("新建或加载项目时默认启用尾帧关联 (Enable End Frame by Default)")
+        self.chk_default_enable_end_frame.setStyleSheet("font-size: 13px; color: #5D4037; font-weight: bold;")
+        end_frame_layout.addWidget(self.chk_default_enable_end_frame)
+        
+        lbl_end_frame_hint = QLabel("💡 开启后，支持为每条分句文案关联尾帧图片，并将前一句的尾帧自动联动填充为后一句的首帧；导出任务时将附带尾帧数据。")
+        lbl_end_frame_hint.setWordWrap(True)
+        lbl_end_frame_hint.setStyleSheet("color: #8D6E63; font-style: italic; font-size: 11px;")
+        end_frame_layout.addWidget(lbl_end_frame_hint)
+        
+        main_layout.addWidget(group_end_frame)
+        
         # Bottom Buttons
         bottom_layout = QHBoxLayout()
         btn_reset = QPushButton("🔄 恢复默认设置")
@@ -292,6 +310,9 @@ class SettingsDialog(QDialog):
             self.combo_language.setCurrentIndex(idx)
         else:
             self.combo_language.setCurrentIndex(0)  # Default to Spanish
+            
+        # Load end frame setting
+        self.chk_default_enable_end_frame.setChecked(getattr(self.cm, "enable_end_frame", False))
 
     def add_char_row(self):
         row = self.table_char_dur.rowCount()
@@ -380,6 +401,9 @@ class SettingsDialog(QDialog):
         
         # Read language
         self.cm.speech_language = self.combo_language.currentData() or "es"
+        
+        # Read end frame setting
+        self.cm.enable_end_frame = self.chk_default_enable_end_frame.isChecked()
         
         if self.cm.save():
             QMessageBox.information(self, "成功", "设置保存成功！已按新规则生效。")

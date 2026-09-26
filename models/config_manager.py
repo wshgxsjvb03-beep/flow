@@ -59,6 +59,10 @@ class ConfigManager:
         self.enable_plugin_server = True
         self.plugin_server_port = 18188
         
+        # End frame settings
+        self.DEFAULT_ENABLE_END_FRAME = False
+        self.enable_end_frame = self.DEFAULT_ENABLE_END_FRAME
+        
         self.load()
 
     def load(self):
@@ -91,6 +95,9 @@ class ConfigManager:
                     # Load plugin server settings
                     self.enable_plugin_server = data.get("enable_plugin_server", True)
                     self.plugin_server_port = data.get("plugin_server_port", 18188)
+                    
+                    # Load end frame setting
+                    self.enable_end_frame = data.get("enable_end_frame", getattr(self, "DEFAULT_ENABLE_END_FRAME", False))
             except Exception as e:
                 print(f"Error loading config: {e}")
 
@@ -114,7 +121,8 @@ class ConfigManager:
             "elevenlabs_api_keys": self.elevenlabs_api_keys,
             "speech_language": self.speech_language,
             "enable_plugin_server": self.enable_plugin_server,
-            "plugin_server_port": self.plugin_server_port
+            "plugin_server_port": self.plugin_server_port,
+            "enable_end_frame": self.enable_end_frame
         })
         try:
             with open(self.config_path, "w", encoding="utf-8") as f:
@@ -128,6 +136,7 @@ class ConfigManager:
         self.max_batch_points = self.DEFAULT_MAX_BATCH_POINTS
         self.char_duration_rules = [dict(r) for r in self.DEFAULT_CHAR_DURATION_RULES]
         self.duration_points_rules = [dict(r) for r in self.DEFAULT_DURATION_POINTS_RULES]
+        self.enable_end_frame = getattr(self, "DEFAULT_ENABLE_END_FRAME", False)
         self.save()
 
     def get_duration_for_length(self, length):
