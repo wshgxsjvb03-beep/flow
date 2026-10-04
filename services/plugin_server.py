@@ -22,13 +22,13 @@ class PluginServer(QObject):
     def __init__(self, port=18188, parent=None):
         super().__init__(parent)
         self.port = port
-        self.ports = [port, 8000, 8765] if port not in (8000, 8765) else [8000, 8765, 18188]
+        self.ports = [port] if port != 18188 else [18188, 8000, 8765]
         self.servers = []
         self.clients = {}  # socket -> dict info: {client_id, name, remaining_points, status, socket}
         self.client_id_counter = 1
 
     def start(self):
-        """Starts the WebSocket server listening on ports 18188, 8000, 8765."""
+        """Starts the WebSocket server listening on configured ports."""
         if self.servers:
             return True
 
@@ -78,7 +78,52 @@ class PluginServer(QObject):
         if not server:
             return
         socket = server.nextPendingConnection()
-        
+        if not socket:
+            return
+            
+        # Security: Validate Origin header against Cross-Site WebSocket Hijacking (CSWSH)
+        client_origin = socket.origin()
+        if client_origin:
+            origin_lower = client_origin.lower().strip()
+            # Explicitly reject 'null' origin to prevent CSWSH attacks from sandboxed iframes or data URLs
+            if origin_lower == "null":
+                logger.warning("🚨 [Security] Rejected untrusted WebSocket connection from null Origin")
+                socket.close()
+                return
+
+            import urllib.parse
+            try:
+                parsed_origin = urllib.parse.urlparse(origin_lower)
+                scheme = parsed_origin.scheme
+                hostname = (parsed_origin.hostname or "").lower()
+            except Exception:
+                logger.warning(f"🚨 [Security] Rejected malformed Origin: {client_origin}")
+                socket.close()
+                return
+
+            is_allowed = False
+            # 1. Browser extension schemes
+            if scheme in ("chrome-extension", "moz-extension", "safari-web-extension"):
+                is_allowed = True
+            # 2. Localhost web origins
+            elif scheme in ("http", "https") and hostname in ("127.0.0.1", "localhost"):
+                is_allowed = True
+            # 3. Legitimate Google web origins for Labs / AI Test Kitchen
+            elif scheme == "https":
+                google_hosts = (
+                    "labs.google",
+                    "aitestkitchen.withgoogle.com",
+                    "google.com",
+                    "googleusercontent.com"
+                )
+                if hostname in google_hosts or any(hostname.endswith(f".{d}") for d in google_hosts):
+                    is_allowed = True
+
+            if not is_allowed:
+                logger.warning(f"🚨 [Security] Rejected untrusted WebSocket connection from Origin: {client_origin}")
+                socket.close()
+                return
+
         temp_id = f"Worker_{self.client_id_counter}"
         self.client_id_counter += 1
 

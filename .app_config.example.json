@@ -1,0 +1,47 @@
+{
+    "base_path": "",
+    "max_batch_points": 50,
+    "forced_split_marker": "///",
+    "char_duration_rules": [
+        {
+            "max_chars": 40,
+            "duration": 4
+        },
+        {
+            "max_chars": 90,
+            "duration": 6
+        },
+        {
+            "max_chars": 130,
+            "duration": 8
+        },
+        {
+            "max_chars": 170,
+            "duration": 10
+        }
+    ],
+    "duration_points_rules": [
+        {
+            "duration": 4,
+            "points": 7
+        },
+        {
+            "duration": 6,
+            "points": 10
+        },
+        {
+            "duration": 8,
+            "points": 12
+        },
+        {
+            "duration": 10,
+            "points": 15
+        }
+    ],
+    "gladia_api_keys": [],
+    "elevenlabs_api_keys": [],
+    "speech_language": "es",
+    "enable_plugin_server": true,
+    "plugin_server_port": 18188,
+    "enable_end_frame": false
+}

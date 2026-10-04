@@ -1,7 +1,6 @@
 # -*- coding: utf-8 -*-
 import os
 import re
-import subprocess
 import sys
 import logging
 from pathlib import Path
@@ -567,8 +566,15 @@ class ProjectDetailWidget(QWidget):
             self.lbl_download_status.setText("下载状态: 正在后台自动下载中...")
             self.btn_download.setEnabled(False)
         else:
-            self.lbl_download_status.setText("下载状态: 未开始")
-            self.btn_download.setEnabled(True)
+            # Check if downloads folder already contains files to prevent duplicate download triggers
+            downloads_dir = self.project_path / "downloads" if self.project_path else None
+            existing_files = [f for f in downloads_dir.iterdir() if f.is_file() and not f.name.endswith(".part")] if (downloads_dir and downloads_dir.exists()) else []
+            if existing_files:
+                self.lbl_download_status.setText(f"下载状态: 已下载完成 (共 {len(existing_files)} 个素材)")
+                self.btn_download.setEnabled(True)
+            else:
+                self.lbl_download_status.setText("下载状态: 未开始")
+                self.btn_download.setEnabled(True)
         
         # Refresh the video compare tab
         if hasattr(self, 'video_compare_widget'):
@@ -1132,6 +1138,8 @@ class ProjectDetailWidget(QWidget):
             
         downloads_dir = self.project_path / "downloads"
         if downloads_dir.exists():
+            from services.downloader import ensure_unique_stems_in_dir
+            ensure_unique_stems_in_dir(downloads_dir)
             for item in downloads_dir.iterdir():
                 if item.is_file():
                     # Display filename and file size in KB
@@ -2200,46 +2208,7 @@ class ProjectDetailWidget(QWidget):
                 # Create a new batch
                 batches.append([task])
 
-        # Intelligent Points Maximization: Upgrade durations in each batch to squeeze remaining budget
-        # Duration rules sorted ascending: e.g. [(4, 7), (6, 10), (8, 12), (10, 15)]
-        if self.config_manager and self.config_manager.duration_points_rules:
-            tiers = sorted(self.config_manager.duration_points_rules, key=lambda x: x["duration"])
-        else:
-            tiers = [{"duration": 4, "points": 7}, {"duration": 6, "points": 10}, 
-                     {"duration": 8, "points": 12}, {"duration": 10, "points": 15}]
-                     
-        dur_to_next = {}
-        for i in range(len(tiers) - 1):
-            curr_d = tiers[i]["duration"]
-            next_d = tiers[i+1]["duration"]
-            diff_p = tiers[i+1]["points"] - tiers[i]["points"]
-            dur_to_next[curr_d] = (next_d, diff_p)
 
-        for batch in batches:
-            cur_pts = sum(get_task_points(t) for t in batch)
-            headroom = max_batch_points - cur_pts
-            
-            while headroom > 0:
-                # Candidates that can be upgraded to next duration tier
-                candidates = [t for t in batch if t["duration"] in dur_to_next]
-                if not candidates:
-                    break
-                    
-                # Priority: 1) higher current duration, 2) longer character length (_text_len)
-                candidates.sort(key=lambda t: (t["duration"], t["_text_len"]), reverse=True)
-                
-                upgraded_any = False
-                for task in candidates:
-                    next_dur, cost_diff = dur_to_next[task["duration"]]
-                    if cost_diff <= headroom:
-                        task["duration"] = next_dur
-                        headroom -= cost_diff
-                        upgraded_any = True
-                        break # Re-sort & re-evaluate candidates for next upgrade
-                        
-                if not upgraded_any:
-                    break
-                
         # Sort tasks within each batch by their original chronological index for clear display
         for batch in batches:
             batch.sort(key=lambda t: t["_original_index"])
@@ -2332,6 +2301,16 @@ class ProjectDetailWidget(QWidget):
             if not target_path_str or status != "success":
                 continue
                 
+            # 安全边界校验：确保目标路径在工程目录或当前基础存储路径下
+            if self.project_path:
+                try:
+                    resolved_target = Path(target_path_str).resolve()
+                    base_storage = self.project_path.parent.resolve()
+                    if not (resolved_target.is_relative_to(self.project_path.resolve()) or resolved_target.is_relative_to(base_storage)):
+                        continue
+                except Exception:
+                    continue
+                
             target_path = Path(target_path_str)
             filename = target_path.name
             
@@ -2395,9 +2374,10 @@ class ProjectDetailWidget(QWidget):
 
     def on_plugin_report_received(self, report_data):
         """Processes execution report received via WebSocket from a browser plugin."""
-        if not self.project_model:
+        if not self.project_model or not self.project_path:
             return
             
+        safe_proj_root = Path(self.project_path).resolve()
         data = report_data.get("data", [])
         segments = self.project_model.spanish_segments
         chrome_downloads = Path.home() / "Downloads"
@@ -2435,26 +2415,40 @@ class ProjectDetailWidget(QWidget):
                 self.copied_rows.add(idx)
                 updated_count += 1
                 
-                # 如果没有显式指定 target_path_str，自动推导为 project_path/downloads/videos/01.mp4 等标准路径
-                if not target_path_str and self.project_path:
-                    videos_dir = self.project_path / "downloads" / "videos"
-                    videos_dir.mkdir(parents=True, exist_ok=True)
-                    target_path_str = str((videos_dir / f"{idx + 1:02d}.mp4").resolve())
+                # 校验并规范化 target_path_str 安全边界 (严格保证在工程目录内部)
+                videos_dir = (safe_proj_root / "downloads" / "videos").resolve()
+                videos_dir.mkdir(parents=True, exist_ok=True)
+                fallback_path_str = str((videos_dir / f"{idx + 1:02d}.mp4").resolve())
+
+                if target_path_str:
+                    try:
+                        resolved_target = Path(target_path_str).resolve()
+                        if not resolved_target.is_relative_to(safe_proj_root):
+                            target_path_str = fallback_path_str
+                    except Exception:
+                        target_path_str = fallback_path_str
+                else:
+                    target_path_str = fallback_path_str
 
                 download_success = False
                 target_filename = item.get("target_filename")
                 project_name = item.get("project_name")
                 
+                # 安全过滤：提取纯文件名与工程名，防止目录穿越
+                clean_target_filename = Path(str(target_filename)).name if target_filename else None
+                clean_project_name = Path(str(project_name)).name if project_name else None
+                resolved_chrome_downloads = chrome_downloads.resolve()
+                
                 # 1. 优先扫描 Chrome Downloads 目录并自动移动/复制至当前工程目录
                 possible_sources = []
-                if project_name and target_filename:
-                    possible_sources.append(chrome_downloads / "Flow" / project_name / target_filename)
-                if target_filename:
-                    possible_sources.append(chrome_downloads / "Flow" / target_filename)
+                if clean_project_name and clean_target_filename:
+                    possible_sources.append(chrome_downloads / "Flow" / clean_project_name / clean_target_filename)
+                if clean_target_filename:
+                    possible_sources.append(chrome_downloads / "Flow" / clean_target_filename)
                 
                 if self.project_model:
-                    p_id = self.project_model.project_id
-                    filename = Path(target_path_str).name
+                    p_id = Path(str(self.project_model.project_id)).name
+                    filename = Path(str(target_path_str)).name
                     possible_sources.extend([
                         chrome_downloads / "Flow" / p_id / filename,
                         chrome_downloads / "Flow" / f"{p_id}-flow" / filename,
@@ -2464,9 +2458,13 @@ class ProjectDetailWidget(QWidget):
 
                 source_file = None
                 for p in possible_sources:
-                    if p.exists() and p.is_file() and p.stat().st_size > 1024:
-                        source_file = p
-                        break
+                    try:
+                        resolved_p = p.resolve()
+                        if resolved_p.is_relative_to(resolved_chrome_downloads) and resolved_p.exists() and resolved_p.is_file() and resolved_p.stat().st_size > 1024:
+                            source_file = resolved_p
+                            break
+                    except Exception:
+                        continue
                 
                 # 通配扫描最近在 Downloads/Flow 目录中生成的 mp4 文件
                 if not source_file:
@@ -2480,51 +2478,109 @@ class ProjectDetailWidget(QWidget):
 
                 if source_file and target_path_str:
                     try:
-                        target_path = Path(target_path_str)
-                        target_path.parent.mkdir(parents=True, exist_ok=True)
-                        shutil.copy2(source_file, target_path)
-                        download_success = True
-                        logger.info(f"✅ [Chrome 下载扫描成功] 成功将下载文件 {source_file} 归档至: {target_path}")
-                    except Exception as copy_err:
-                        logger.warning(f"复制 Chrome 下载文件异常: {copy_err}")
+                        target_path = Path(target_path_str).resolve()
+                        if target_path.is_relative_to(safe_proj_root):
+                            target_path.parent.mkdir(parents=True, exist_ok=True)
+                            shutil.move(str(source_file), str(target_path))
+                            download_success = True
+                            logger.info(f"✅ [Chrome 下载扫描成功] 成功将下载文件 {source_file} 归位移动至: {target_path}")
+                    except Exception as move_err:
+                        logger.warning(f"移动 Chrome 下载文件异常: {move_err}")
 
                 # 2. 次选方案：解码 Base64 视频字节流直接写入
                 if not download_success and base64_data and target_path_str:
                     try:
-                        target_path = Path(target_path_str)
-                        target_path.parent.mkdir(parents=True, exist_ok=True)
-                        video_bytes = base64.b64decode(base64_data)
-                        if len(video_bytes) > 1024:
-                            with open(target_path, "wb") as f:
-                                f.write(video_bytes)
-                            download_success = True
-                            logger.info(f"✅ Base64 视频字节流成功写入: {target_path}")
+                        target_path = Path(target_path_str).resolve()
+                        if target_path.is_relative_to(safe_proj_root):
+                            target_path.parent.mkdir(parents=True, exist_ok=True)
+                            video_bytes = base64.b64decode(base64_data)
+                            if len(video_bytes) > 1024:
+                                with open(target_path, "wb") as f:
+                                    f.write(video_bytes)
+                                download_success = True
+                                logger.info(f"✅ Base64 视频字节流成功写入: {target_path}")
                     except Exception as b64_err:
                         logger.warning(f"解码 Base64 视频失败: {b64_err}")
 
-                # 3. 备用方案：HTTP 直连流下载
+                # 3. 备用方案：HTTP 直连流下载 (严格校验协议、域名解析防 DNS Rebinding / 私网 / 回环 SSRF，并安全处理重定向与超时)
                 if not download_success and download_url and target_path_str:
-                    try:
-                        import requests
-                        target_path = Path(target_path_str)
-                        target_path.parent.mkdir(parents=True, exist_ok=True)
-                        headers = {
-                            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-                        }
-                        resp = requests.get(download_url, headers=headers, allow_redirects=True, stream=True, timeout=60)
-                        if resp.status_code == 200:
-                            with open(target_path, "wb") as f:
-                                for chunk in resp.iter_content(chunk_size=16384):
-                                    f.write(chunk)
-                            download_success = True
-                            logger.info(f"✅ HTTP 直连下载成功: {target_path}")
-                    except Exception as dl_err:
-                        logger.warning(f"HTTP 直连下载异常: {dl_err}")
+                    dl_url_str = str(download_url).strip()
+                    if dl_url_str.startswith(("http://", "https://")):
+                        try:
+                            from urllib.parse import urlparse, urljoin
+                            import socket
+                            import ipaddress
+                            import requests
+
+                            def is_safe_external_url(url_val):
+                                p = urlparse(url_val)
+                                if p.scheme not in ("http", "https"):
+                                    return False
+                                host = (p.hostname or "").strip().lower()
+                                if not host or host in ("localhost", "127.0.0.1", "::1", "0.0.0.0"):  # nosec B104 - host rejection check
+                                    return False
+                                if host.endswith(".local") or host.endswith(".internal"):
+                                    return False
+                                try:
+                                    addrs = socket.getaddrinfo(host, None)
+                                    if not addrs:
+                                        return False
+                                    for addr in addrs:
+                                        ip_obj = ipaddress.ip_address(addr[4][0])
+                                        if (ip_obj.is_private or ip_obj.is_loopback or 
+                                            ip_obj.is_link_local or ip_obj.is_reserved or 
+                                            ip_obj.is_multicast or ip_obj.is_unspecified):
+                                            return False
+                                    return True
+                                except Exception:
+                                    return False
+
+                            curr_url = dl_url_str
+                            session = requests.Session()
+                            headers = {
+                                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+                            }
+                            resp = None
+                            for _ in range(5):
+                                if not is_safe_external_url(curr_url):
+                                    logger.warning(f"🚨 [Security] 拒绝向私网/回环地址发起直连下载或重定向: {curr_url}")
+                                    resp = None
+                                    break
+                                resp = session.get(curr_url, headers=headers, allow_redirects=False, stream=True, timeout=(15, 60))
+                                if resp.is_redirect or resp.status_code in (301, 302, 303, 307, 308):
+                                    loc = resp.headers.get("Location")
+                                    if not loc:
+                                        break
+                                    curr_url = urljoin(curr_url, loc)
+                                else:
+                                    break
+
+                            if resp and resp.status_code == 200:
+                                target_path = Path(target_path_str).resolve()
+                                if target_path.is_relative_to(safe_proj_root):
+                                    target_path.parent.mkdir(parents=True, exist_ok=True)
+                                    part_path = target_path.with_name(f"{target_path.name}.part")
+                                    try:
+                                        with open(part_path, "wb") as f:
+                                            for chunk in resp.iter_content(chunk_size=16384):
+                                                f.write(chunk)
+                                        if target_path.exists():
+                                            target_path.unlink()
+                                        shutil.move(str(part_path), str(target_path))
+                                        download_success = True
+                                        logger.info(f"✅ HTTP 直连下载成功: {target_path}")
+                                    finally:
+                                        if part_path.exists():
+                                            part_path.unlink(missing_ok=True)
+                        except Exception as dl_err:
+                            logger.warning(f"HTTP 直连下载异常: {dl_err}")
 
                 # 4. 延迟 1.5 秒与 4 秒再次扫描 Chrome 下载目录 (解决 Chrome 写入未完成问题)
                 if not download_success and target_path_str:
                     def try_delayed_copy(tp_str=target_path_str):
-                        tp = Path(tp_str)
+                        tp = Path(tp_str).resolve()
+                        if not tp.is_relative_to(safe_proj_root):
+                            return
                         flow_dir = chrome_downloads / "Flow"
                         if flow_dir.exists():
                             recent_mp4s = list(flow_dir.glob("**/*.mp4"))

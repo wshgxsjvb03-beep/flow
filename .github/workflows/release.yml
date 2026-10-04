@@ -30,11 +30,13 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install pyinstaller PyQt6 pillow requests gdown beautifulsoup4
+          pip install pyinstaller -r requirements.txt
 
       - name: Build executable (Windows)
         if: matrix.os == 'windows-latest'
         shell: pwsh
+        env:
+          TAG_NAME: ${{ github.ref_name }}
         run: |
           pyinstaller --name=flow --windowed `
             --hidden-import=PIL `
@@ -69,10 +71,12 @@ jobs:
           cp LICENSE dist/flow/
           cp LICENSE.LIST dist/flow/
           cd dist
-          Compress-Archive -Path flow -DestinationPath flow-windows-${{ github.ref_name }}.zip
+          Compress-Archive -Path flow -DestinationPath "flow-windows-$env:TAG_NAME.zip"
 
       - name: Build executable (macOS)
         if: matrix.os == 'macos-latest'
+        env:
+          TAG_NAME: ${{ github.ref_name }}
         run: |
           pyinstaller --name=flow --windowed \
             --hidden-import=PIL \
@@ -107,7 +111,7 @@ jobs:
           cp LICENSE dist/flow/
           cp LICENSE.LIST dist/flow/
           cd dist
-          zip -r flow-macos-${{ github.ref_name }}.zip flow
+          zip -r "flow-macos-${TAG_NAME}.zip" flow
 
       - name: Attest Build Provenance
         uses: actions/attest-build-provenance@v2

@@ -132,11 +132,21 @@ class ProjectModel:
         return lines
 
     def update_media_files(self):
-        """Scans project_dir/downloads and updates associated_media."""
+        """Scans project_dir/downloads and updates associated_media, ensuring unique stems across all files."""
         downloads_dir = self.project_dir / "downloads"
         if not downloads_dir.exists():
             return
             
+        from services.downloader import ensure_unique_stems_in_dir
+        rename_map = ensure_unique_stems_in_dir(downloads_dir)
+        if rename_map:
+            for seg in self.spanish_segments:
+                if isinstance(seg, dict):
+                    if seg.get("image_name") in rename_map:
+                        seg["image_name"] = rename_map[seg["image_name"]]
+                    if seg.get("end_image_name") in rename_map:
+                        seg["end_image_name"] = rename_map[seg["end_image_name"]]
+
         existing_paths = {item["file_path"] for item in self.associated_media}
         new_media = list(self.associated_media)
         

@@ -385,8 +385,7 @@ class VideoChecker:
             if direct_proj_flow.exists() and direct_proj_flow.is_dir():
                 if direct_proj_flow.resolve() not in [p.resolve() for p in pre_relocate_search_dirs]:
                     pre_relocate_search_dirs.append(direct_proj_flow)
-            if not pre_relocate_search_dirs:
-                pre_relocate_search_dirs.append(flow_base)
+            # Note: Do NOT fall back to flow_base root during deletion to prevent deleting videos belonging to other projects.
 
         deleted_files_count = 0
         error_msgs = []

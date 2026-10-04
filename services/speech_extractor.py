@@ -1,13 +1,23 @@
 # -*- coding: utf-8 -*-
 """
 Speech extraction service for extracting text from video files using
-Gladia API or ElevenLabs API, with multi-key round-robin support.
+Gladia API or ElevenLabs API, with multi-key round-robin support,
+lightweight local audio pre-extraction, and thread-safe concurrency.
 """
+import os
 import time
+import uuid
 import difflib
+import logging
+import tempfile
+import threading
+import subprocess
+import concurrent.futures
 import requests
 from pathlib import Path
 from PyQt6.QtCore import QThread, pyqtSignal
+
+logger = logging.getLogger(__name__)
 
 
 class SpeechExtractor:
@@ -22,16 +32,74 @@ class SpeechExtractor:
     
     # Polling config
     MAX_POLL_ATTEMPTS = 60
-    POLL_INTERVAL_SECONDS = 3
     
+    @staticmethod
+    def extract_audio_from_video(video_path):
+        """Extracts a lightweight mono MP3 audio file (16kHz, 48kbps) from video locally.
+        Uses imageio-ffmpeg's standalone binary (or system ffmpeg).
+        Returns Path to temp MP3 file, or None if extraction fails.
+        Caller MUST delete the temporary file after use.
+        """
+        video_path = Path(video_path)
+        if not video_path.exists() or video_path.stat().st_size == 0:
+            return None
+
+        try:
+            try:
+                import imageio_ffmpeg
+                ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+            except Exception:
+                ffmpeg_exe = "ffmpeg"
+
+            temp_dir = Path(tempfile.gettempdir())
+            temp_audio = temp_dir / f"flow_audio_{uuid.uuid4().hex[:10]}.mp3"
+
+            cmd = [
+                ffmpeg_exe,
+                "-y",
+                "-i", str(video_path),
+                "-vn",
+                "-ac", "1",
+                "-ar", "16000",
+                "-b:a", "48k",
+                "-loglevel", "error",
+                str(temp_audio)
+            ]
+
+            startupinfo = None
+            if os.name == 'nt':
+                startupinfo = subprocess.STARTUPINFO()
+                startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+                startupinfo.wShowWindow = subprocess.SW_HIDE
+
+            proc = subprocess.run(
+                cmd,
+                startupinfo=startupinfo,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=15
+            )
+
+            if proc.returncode == 0 and temp_audio.exists() and temp_audio.stat().st_size > 0:
+                logger.info(f"本地提取纯音频成功: {video_path.name} -> {temp_audio.name} ({temp_audio.stat().st_size / 1024:.1f} KB)")
+                return temp_audio
+            else:
+                err_msg = proc.stderr.decode('utf-8', errors='ignore')[:200]
+                logger.warning(f"ffmpeg 提取纯音频未成功 (将回退至原视频上传): {err_msg}")
+        except Exception as e:
+            logger.warning(f"本地提取纯音频异常 (将回退至原视频上传): {e}")
+
+        return None
+
     @staticmethod
     def extract_with_gladia(video_path, api_key, language="es"):
         """Extracts speech text from a video file using Gladia API v2.
         
         Steps:
-        1. Upload file to get audio_url
-        2. Submit transcription job
-        3. Poll for result
+        1. Extract lightweight local audio (~50KB) to bypass heavy video upload
+        2. Upload audio/video file to get audio_url
+        3. Submit transcription job
+        4. Adaptive polling for result (0.8s, 1.2s, 1.5s...)
         
         Returns:
             dict: {"success": bool, "text": str, "error": str}
@@ -44,14 +112,20 @@ class SpeechExtractor:
             "x-gladia-key": api_key,
         }
         
+        temp_audio = None
         try:
+            # Step 0: Try local audio extraction
+            temp_audio = SpeechExtractor.extract_audio_from_video(video_path)
+            upload_target = temp_audio if (temp_audio and temp_audio.exists()) else video_path
+            mime_type = "audio/mpeg" if upload_target.suffix.lower() == ".mp3" else "video/mp4"
+
             # Step 1: Upload file
-            with open(video_path, "rb") as f:
+            with open(upload_target, "rb") as f:
                 upload_response = requests.post(
                     SpeechExtractor.GLADIA_UPLOAD_URL,
                     headers=headers,
-                    files={"audio": (video_path.name, f, "video/mp4")},
-                    timeout=120
+                    files={"audio": (upload_target.name, f, mime_type)},
+                    timeout=90
                 )
             
             if upload_response.status_code != 200 and upload_response.status_code != 201:
@@ -99,9 +173,11 @@ class SpeechExtractor:
             if not result_url:
                 return {"success": False, "text": "", "error": "Gladia 转录返回结果中缺少 result_url"}
             
-            # Step 3: Poll for result
+            # Step 3: Adaptive polling for result (0.8s, 1.2s, 1.5s, 2.0s...)
+            poll_delays = [0.8, 1.2, 1.5, 2.0]
             for attempt in range(SpeechExtractor.MAX_POLL_ATTEMPTS):
-                time.sleep(SpeechExtractor.POLL_INTERVAL_SECONDS)
+                delay = poll_delays[min(attempt, len(poll_delays) - 1)]
+                time.sleep(delay)
                 
                 poll_response = requests.get(
                     result_url,
@@ -144,6 +220,12 @@ class SpeechExtractor:
             return {"success": False, "text": "", "error": "Gladia 网络连接失败，请检查网络"}
         except Exception as e:
             return {"success": False, "text": "", "error": f"Gladia 提取异常: {str(e)}"}
+        finally:
+            if temp_audio and temp_audio.exists():
+                try:
+                    temp_audio.unlink()
+                except Exception:
+                    pass
     
     @staticmethod
     def extract_with_elevenlabs(video_path, api_key, language="es"):
@@ -160,10 +242,16 @@ class SpeechExtractor:
             "xi-api-key": api_key,
         }
         
+        temp_audio = None
         try:
-            with open(video_path, "rb") as f:
+            # Step 0: Try local audio extraction
+            temp_audio = SpeechExtractor.extract_audio_from_video(video_path)
+            upload_target = temp_audio if (temp_audio and temp_audio.exists()) else video_path
+            mime_type = "audio/mpeg" if upload_target.suffix.lower() == ".mp3" else "video/mp4"
+
+            with open(upload_target, "rb") as f:
                 files = {
-                    "file": (video_path.name, f, "video/mp4"),
+                    "file": (upload_target.name, f, mime_type),
                 }
                 data = {
                     "model_id": "scribe_v1",
@@ -175,7 +263,7 @@ class SpeechExtractor:
                     headers=headers,
                     files=files,
                     data=data,
-                    timeout=180
+                    timeout=120
                 )
             
             if response.status_code == 200:
@@ -211,6 +299,12 @@ class SpeechExtractor:
             return {"success": False, "text": "", "error": "ElevenLabs 网络连接失败，请检查网络"}
         except Exception as e:
             return {"success": False, "text": "", "error": f"ElevenLabs 提取异常: {str(e)}"}
+        finally:
+            if temp_audio and temp_audio.exists():
+                try:
+                    temp_audio.unlink()
+                except Exception:
+                    pass
     
     @staticmethod
     def _normalize_word_for_compare(word):
@@ -315,10 +409,10 @@ class SpeechExtractor:
 
 
 class ExtractionWorker(QThread):
-    """Background worker thread for batch speech extraction.
+    """Background worker thread for concurrent batch speech extraction.
     
     Signals:
-        progress(int, int, str): (current_index, total, status_message)
+        progress(int, int, str): (current_completed, total, status_message)
         segment_done(int, str, float): (segment_index, extracted_text, similarity_score)
         finished(int, int, list): (success_count, total_count, errors_list)
     """
@@ -327,7 +421,7 @@ class ExtractionWorker(QThread):
     segment_done = pyqtSignal(int, str, float)
     finished = pyqtSignal(int, int, list)
     
-    def __init__(self, segments_to_process, engine, config_manager, language="es", parent=None):
+    def __init__(self, segments_to_process, engine, config_manager, language="es", max_workers=None, parent=None):
         """
         Args:
             segments_to_process: list of dicts with keys:
@@ -337,6 +431,7 @@ class ExtractionWorker(QThread):
             engine: "gladia" or "elevenlabs"
             config_manager: ConfigManager instance
             language: Language code
+            max_workers: Max concurrent threads (defaults to safe 2-3 workers)
         """
         super().__init__(parent)
         self.segments_to_process = segments_to_process
@@ -344,11 +439,33 @@ class ExtractionWorker(QThread):
         self.config_manager = config_manager
         self.language = language
         self._cancelled = False
+        self._executor = None
+        
+        total_tasks = len(segments_to_process)
+        if max_workers is not None:
+            self.max_workers = max(1, min(max_workers, total_tasks)) if total_tasks > 0 else 1
+        else:
+            if engine == "gladia":
+                key_count = len(config_manager.gladia_api_keys) if config_manager else 0
+            elif engine == "elevenlabs":
+                key_count = len(config_manager.elevenlabs_api_keys) if config_manager else 0
+            else:
+                key_count = 1
+                
+            if key_count <= 1:
+                self.max_workers = min(2, total_tasks) if total_tasks > 0 else 1
+            else:
+                self.max_workers = min(3, key_count, total_tasks) if total_tasks > 0 else 1
     
     def cancel(self):
         """Requests cancellation of the extraction process."""
         self._cancelled = True
         self.requestInterruption()
+        if self._executor:
+            try:
+                self._executor.shutdown(wait=False, cancel_futures=True)
+            except Exception:
+                pass
     
     def stop(self):
         """Stops the worker thread safely."""
@@ -358,37 +475,74 @@ class ExtractionWorker(QThread):
             self.wait(2000)
 
     def run(self):
-        """Main extraction loop - processes segments one by one."""
+        """Main extraction loop - processes segments concurrently using a safe thread pool."""
         total = len(self.segments_to_process)
+        if total == 0:
+            self.finished.emit(0, 0, [])
+            return
+            
         success_count = 0
         errors = []
+        completed_count = 0
+        lock = threading.Lock()
         
         # Reset key rotation at start
-        self.config_manager.reset_key_rotation()
+        if self.config_manager:
+            self.config_manager.reset_key_rotation()
+            
+        self.progress.emit(0, total, f"🚀 启动并发提取 (并发数: {self.max_workers})...")
         
-        for i, seg_info in enumerate(self.segments_to_process):
+        def process_segment(seg_info):
+            nonlocal success_count, completed_count
             if self._cancelled or self.isInterruptionRequested():
-                self.progress.emit(i, total, "⛔ 已取消提取")
-                break
+                return
             
             seg_idx = seg_info["segment_index"]
             video_path = seg_info["video_path"]
             original_text = seg_info["original_text"]
             
-            self.progress.emit(i + 1, total, f"正在提取第 {seg_idx + 1} 段...")
-            
             result = SpeechExtractor.extract_with_retry(
                 video_path, self.engine, self.config_manager, self.language
             )
             
-            if result["success"]:
-                extracted_text = result["text"]
-                similarity = SpeechExtractor.calculate_similarity(original_text, extracted_text)
-                self.segment_done.emit(seg_idx, extracted_text, similarity)
-                success_count += 1
-            else:
-                error_msg = f"片段 {seg_idx + 1}: {result['error']}"
-                errors.append(error_msg)
-                self.segment_done.emit(seg_idx, "", 0.0)
+            if self._cancelled or self.isInterruptionRequested():
+                return
+            
+            with lock:
+                completed_count += 1
+                cur_completed = completed_count
+                if result["success"]:
+                    success_count += 1
+                else:
+                    errors.append(f"片段 {seg_idx + 1}: {result.get('error', '未知错误')}")
+            
+            if not self._cancelled and not self.isInterruptionRequested():
+                if result["success"]:
+                    extracted_text = result["text"]
+                    similarity = SpeechExtractor.calculate_similarity(original_text, extracted_text)
+                    self.segment_done.emit(seg_idx, extracted_text, similarity)
+                else:
+                    self.segment_done.emit(seg_idx, "", 0.0)
+                    
+                self.progress.emit(
+                    cur_completed, total, 
+                    f"正在并发提取中 ({cur_completed}/{total} 已完成)..."
+                )
         
+        with concurrent.futures.ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+            self._executor = executor
+            futures = [executor.submit(process_segment, seg) for seg in self.segments_to_process]
+            for f in concurrent.futures.as_completed(futures):
+                if self._cancelled or self.isInterruptionRequested():
+                    executor.shutdown(wait=False, cancel_futures=True)
+                    break
+                try:
+                    f.result()
+                except Exception as e:
+                    logger.warning(f"Worker task error: {e}")
+            self._executor = None
+            
+        if self._cancelled or self.isInterruptionRequested():
+            self.progress.emit(completed_count, total, "⛔ 已取消提取")
+            
         self.finished.emit(success_count, total, errors)

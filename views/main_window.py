@@ -749,6 +749,14 @@ class MainWindow(QMainWindow):
             # 2. Delete the directory recursively
             import shutil
             try:
+                base_storage = self.storage_manager.get_base_path()
+                if base_storage:
+                    resolved_base = base_storage.resolve()
+                    resolved_proj = project_path.resolve()
+                    if not resolved_proj.is_relative_to(resolved_base) or resolved_proj == resolved_base:
+                        QMessageBox.critical(self, "错误", "安全拦截：项目路径不在存储总路径范围内，拒绝删除！")
+                        return
+
                 if project_path.exists() and project_path.is_dir():
                     shutil.rmtree(project_path)
                 

@@ -292,5 +292,8 @@ class ImportDialog(QDialog):
             except Exception as e:
                 print(f"Error importing row {row_idx}: {e}")
                 
-        QMessageBox.information(self, "成功", f"成功导入并创建了 {success_count} 个工程项目！")
+        msg = f"成功导入并创建了 {success_count} 个工程项目！"
+        if success_count > 0:
+            msg += "\n\n💡 提示：包含云盘链接的项目已在后台自动开始下载素材，无需重复点击下载。"
+        QMessageBox.information(self, "成功", msg)
         self.accept()

@@ -4,7 +4,11 @@ __pycache__/
 .app_config.json
 .DS_Store
 dist/
+build/
 **/downloads/
 scratch/
 *.log
 error.log
+.env
+.env.*
+!.env.example

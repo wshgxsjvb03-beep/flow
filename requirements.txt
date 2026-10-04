@@ -3,3 +3,5 @@ beautifulsoup4==4.15.0
 gdown==6.1.0
 requests==2.34.2
 pillow==12.3.0
+urllib3>=2.8.0
+soupsieve>=2.9.0

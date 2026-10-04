@@ -1,5 +1,8 @@
 # -*- coding: utf-8 -*-
+import os
+import re
 import json
+import threading
 from pathlib import Path
 
 class ConfigManager:
@@ -54,6 +57,7 @@ class ConfigManager:
         self.speech_language = self.DEFAULT_SPEECH_LANGUAGE
         self._gladia_key_index = 0     # Current rotation index
         self._elevenlabs_key_index = 0 # Current rotation index
+        self._key_lock = threading.Lock() # Thread lock for key rotation
         
         # Plugin server settings
         self.enable_plugin_server = True
@@ -65,8 +69,27 @@ class ConfigManager:
         
         self.load()
 
+    def _load_dotenv(self):
+        """Loads environment variables from .env in workspace_dir if present."""
+        env_path = self.workspace_dir / ".env"
+        if env_path.exists() and env_path.is_file():
+            try:
+                with open(env_path, "r", encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line or line.startswith("#") or "=" not in line:
+                            continue
+                        k, v = line.split("=", 1)
+                        k = k.strip()
+                        v = v.strip().strip("'\"")
+                        if k and k not in os.environ:
+                            os.environ[k] = v
+            except Exception as e:
+                print(f"Error reading .env file: {e}")
+
     def load(self):
-        """Loads configuration from .app_config.json."""
+        """Loads configuration from .app_config.json and .env."""
+        self._load_dotenv()
         if self.config_path.exists():
             try:
                 with open(self.config_path, "r", encoding="utf-8") as f:
@@ -100,6 +123,15 @@ class ConfigManager:
                     self.enable_end_frame = data.get("enable_end_frame", getattr(self, "DEFAULT_ENABLE_END_FRAME", False))
             except Exception as e:
                 print(f"Error loading config: {e}")
+
+        # Environment variables take precedence if set
+        env_gladia = os.environ.get("GLADIA_API_KEYS")
+        if env_gladia:
+            self.gladia_api_keys = [k.strip() for k in re.split(r'[\n,]+', env_gladia) if k.strip()]
+
+        env_eleven = os.environ.get("ELEVENLABS_API_KEYS")
+        if env_eleven:
+            self.elevenlabs_api_keys = [k.strip() for k in re.split(r'[\n,]+', env_eleven) if k.strip()]
 
     def save(self):
         """Saves current configuration to .app_config.json without losing existing keys."""
@@ -176,22 +208,25 @@ class ConfigManager:
     def get_next_gladia_key(self):
         """Returns the next Gladia API key using round-robin rotation.
         Returns None if no keys are configured."""
-        if not self.gladia_api_keys:
-            return None
-        key = self.gladia_api_keys[self._gladia_key_index % len(self.gladia_api_keys)]
-        self._gladia_key_index += 1
-        return key
+        with getattr(self, "_key_lock", threading.Lock()):
+            if not self.gladia_api_keys:
+                return None
+            key = self.gladia_api_keys[self._gladia_key_index % len(self.gladia_api_keys)]
+            self._gladia_key_index += 1
+            return key
 
     def get_next_elevenlabs_key(self):
         """Returns the next ElevenLabs API key using round-robin rotation.
         Returns None if no keys are configured."""
-        if not self.elevenlabs_api_keys:
-            return None
-        key = self.elevenlabs_api_keys[self._elevenlabs_key_index % len(self.elevenlabs_api_keys)]
-        self._elevenlabs_key_index += 1
-        return key
+        with getattr(self, "_key_lock", threading.Lock()):
+            if not self.elevenlabs_api_keys:
+                return None
+            key = self.elevenlabs_api_keys[self._elevenlabs_key_index % len(self.elevenlabs_api_keys)]
+            self._elevenlabs_key_index += 1
+            return key
 
     def reset_key_rotation(self):
         """Resets the round-robin key rotation indices to 0."""
-        self._gladia_key_index = 0
-        self._elevenlabs_key_index = 0
+        with getattr(self, "_key_lock", threading.Lock()):
+            self._gladia_key_index = 0
+            self._elevenlabs_key_index = 0

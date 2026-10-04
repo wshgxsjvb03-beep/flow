@@ -1,6 +1,5 @@
 # -*- coding: utf-8 -*-
 import os
-import subprocess
 import sys
 from pathlib import Path
 from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel,
@@ -894,12 +893,7 @@ class VideoCompareWidget(QWidget):
     def play_external(self):
         """Opens the current video file in the system's default video player."""
         if self._current_video_path and self._current_video_path.exists():
-            if sys.platform == 'win32':
-                os.startfile(str(self._current_video_path))
-            elif sys.platform == 'darwin':
-                subprocess.Popen(['open', str(self._current_video_path)])
-            else:
-                subprocess.Popen(['xdg-open', str(self._current_video_path)])
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(self._current_video_path)))
         else:
             QMessageBox.warning(self, "提示", "没有可播放的视频文件。")
     
