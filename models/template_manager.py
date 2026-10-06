@@ -24,7 +24,7 @@ class TemplateManager:
         self.load_motions()
 
     def load_templates(self):
-        """Loads prompt templates from file. Initializes defaults if missing."""
+        """Loads prompt templates from file. Initializes defaults or example if missing."""
         if self.templates_path.exists():
             try:
                 with open(self.templates_path, "r", encoding="utf-8") as f:
@@ -35,7 +35,20 @@ class TemplateManager:
                 print(f"Error loading templates: {e}")
                 self.init_default_templates()
         else:
-            self.init_default_templates()
+            example_path = self.workspace_dir / "prompt_templates.example.json"
+            if example_path.exists():
+                try:
+                    with open(example_path, "r", encoding="utf-8") as f:
+                        self.templates = json.load(f)
+                    if self.templates:
+                        self.save_templates()
+                    else:
+                        self.init_default_templates()
+                except Exception as e:
+                    print(f"Error loading example templates: {e}")
+                    self.init_default_templates()
+            else:
+                self.init_default_templates()
 
     def save_templates(self):
         """Saves prompt templates to file."""
@@ -48,7 +61,7 @@ class TemplateManager:
             return False
 
     def load_motions(self):
-        """Loads camera motion presets. Initializes defaults if missing."""
+        """Loads camera motion presets. Initializes defaults or example if missing."""
         if self.motions_path.exists():
             try:
                 with open(self.motions_path, "r", encoding="utf-8") as f:
@@ -59,7 +72,20 @@ class TemplateManager:
                 print(f"Error loading motions: {e}")
                 self.init_default_motions()
         else:
-            self.init_default_motions()
+            example_path = self.workspace_dir / "camera_motions.example.json"
+            if example_path.exists():
+                try:
+                    with open(example_path, "r", encoding="utf-8") as f:
+                        self.motions = json.load(f)
+                    if self.motions:
+                        self.save_motions()
+                    else:
+                        self.init_default_motions()
+                except Exception as e:
+                    print(f"Error loading example motions: {e}")
+                    self.init_default_motions()
+            else:
+                self.init_default_motions()
 
     def save_motions(self):
         """Saves camera motion presets to file."""

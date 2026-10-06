@@ -66,8 +66,12 @@ jobs:
             --hidden-import=services.plugin_server `
             --hidden-import=services.pipeline_scheduler `
             main.py
-          cp camera_motions.json dist/flow/
-          cp prompt_templates.json dist/flow/
+          if (Test-Path camera_motions.json) { cp camera_motions.json dist/flow/ } else { cp camera_motions.example.json dist/flow/camera_motions.json }
+          if (Test-Path prompt_templates.json) { cp prompt_templates.json dist/flow/ } else { cp prompt_templates.example.json dist/flow/prompt_templates.json }
+          if (Test-Path camera_motions.example.json) { cp camera_motions.example.json dist/flow/ }
+          if (Test-Path prompt_templates.example.json) { cp prompt_templates.example.json dist/flow/ }
+          if (Test-Path .app_config.example.json) { cp .app_config.example.json dist/flow/ }
+          if (Test-Path .env.example) { cp .env.example dist/flow/ }
           cp LICENSE dist/flow/
           cp LICENSE.LIST dist/flow/
           cd dist
@@ -106,8 +110,12 @@ jobs:
             --hidden-import=services.plugin_server \
             --hidden-import=services.pipeline_scheduler \
             main.py
-          cp camera_motions.json dist/flow/
-          cp prompt_templates.json dist/flow/
+          if [ -f camera_motions.json ]; then cp camera_motions.json dist/flow/; else cp camera_motions.example.json dist/flow/camera_motions.json; fi
+          if [ -f prompt_templates.json ]; then cp prompt_templates.json dist/flow/; else cp prompt_templates.example.json dist/flow/prompt_templates.json; fi
+          if [ -f camera_motions.example.json ]; then cp camera_motions.example.json dist/flow/; fi
+          if [ -f prompt_templates.example.json ]; then cp prompt_templates.example.json dist/flow/; fi
+          if [ -f .app_config.example.json ]; then cp .app_config.example.json dist/flow/; fi
+          if [ -f .env.example ]; then cp .env.example dist/flow/; fi
           cp LICENSE dist/flow/
           cp LICENSE.LIST dist/flow/
           cd dist

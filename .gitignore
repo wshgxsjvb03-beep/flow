@@ -2,6 +2,7 @@
 __pycache__/
 *.pyc
 .app_config.json
+!.app_config.example.json
 .DS_Store
 dist/
 build/
@@ -12,3 +13,18 @@ error.log
 .env
 .env.*
 !.env.example
+
+# User local configs, custom templates, and motions
+camera_motions.json
+prompt_templates.json
+!camera_motions.example.json
+!prompt_templates.example.json
+
+# Local user projects and media
+projects/
+
+# Secret keys and credentials
+*.key
+*.pem
+*.cert
+credentials*.json
