@@ -124,6 +124,24 @@ class SettingsDialog(QDialog):
         
         main_layout.addWidget(group_points)
         
+        # Section 1.5: Minimum segment characters
+        group_min_chars = QGroupBox("1.5 分段最小字符数 (Minimum Segment Characters)")
+        min_chars_layout = QHBoxLayout(group_min_chars)
+        min_chars_layout.setContentsMargins(12, 12, 12, 12)
+        
+        min_chars_layout.addWidget(QLabel("分段最小字符数:"))
+        self.spin_min_segment_chars = QSpinBox()
+        self.spin_min_segment_chars.setRange(0, 500)
+        self.spin_min_segment_chars.setSuffix(" 字符")
+        self.spin_min_segment_chars.setToolTip("设为 0 则不限制。分段时任何片段的字符数都不会低于此值，过短的片段会自动合并到相邻片段。")
+        min_chars_layout.addWidget(self.spin_min_segment_chars)
+        
+        lbl_min_hint = QLabel("(* 设为 0 = 不限制；智能分段时过短片段会自动合并到相邻句)")
+        lbl_min_hint.setStyleSheet("color: #8D6E63; font-style: italic; font-size: 11px;")
+        min_chars_layout.addWidget(lbl_min_hint, stretch=1)
+        
+        main_layout.addWidget(group_min_chars)
+        
         # Section 2: Character count -> Duration rules
         group_char_dur = QGroupBox("2. 字符数与时长对应规则 (Char Count -> Seconds)")
         char_layout = QVBoxLayout(group_char_dur)
@@ -251,6 +269,70 @@ class SettingsDialog(QDialog):
         
         main_layout.addWidget(group_end_frame)
         
+        # Section 6: Video Generation Default Rules & Task Interval
+        group_gen_rules = QGroupBox("6. 视频生成默认参数与间隔设置 (Default Video Generation Rules)")
+        gen_rules_layout = QVBoxLayout(group_gen_rules)
+        gen_rules_layout.setContentsMargins(12, 12, 12, 12)
+        gen_rules_layout.setSpacing(10)
+        
+        combo_style = """
+            QComboBox {
+                background-color: white;
+                border: 1px solid #D7CCC8;
+                border-radius: 4px;
+                padding: 4px 8px;
+                font-size: 13px;
+                color: #5D4037;
+            }
+        """
+        
+        # Row 1: Task Interval & Generation Mode
+        row1_layout = QHBoxLayout()
+        row1_layout.addWidget(QLabel("⏱️ 任务完成间隔时间:"))
+        self.spin_task_interval = QSpinBox()
+        self.spin_task_interval.setRange(0, 300)
+        self.spin_task_interval.setSuffix(" 秒")
+        self.spin_task_interval.setFixedWidth(95)
+        self.spin_task_interval.setToolTip("每个任务完成之后等待多少秒再开始下一个任务（例如 3 秒、5 秒，设为 0 则无额外等待）")
+        row1_layout.addWidget(self.spin_task_interval)
+        
+        row1_layout.addSpacing(20)
+        
+        row1_layout.addWidget(QLabel("🎬 默认生成模式:"))
+        self.combo_default_mode = QComboBox()
+        self.combo_default_mode.setStyleSheet(combo_style)
+        for mode_code, mode_label in ConfigManager.SUPPORTED_GENERATION_MODES:
+            self.combo_default_mode.addItem(mode_label, mode_code)
+        row1_layout.addWidget(self.combo_default_mode, stretch=1)
+        gen_rules_layout.addLayout(row1_layout)
+        
+        # Row 2: Aspect Ratio & Video Model
+        row2_layout = QHBoxLayout()
+        row2_layout.addWidget(QLabel("📐 默认画面尺寸:"))
+        self.combo_default_aspect = QComboBox()
+        self.combo_default_aspect.setStyleSheet(combo_style)
+        self.combo_default_aspect.setFixedWidth(135)
+        for aspect_code, aspect_label in ConfigManager.SUPPORTED_ASPECT_RATIOS:
+            self.combo_default_aspect.addItem(aspect_label, aspect_code)
+        row2_layout.addWidget(self.combo_default_aspect)
+        
+        row2_layout.addSpacing(20)
+        
+        row2_layout.addWidget(QLabel("🤖 默认生成模型:"))
+        self.combo_default_model = QComboBox()
+        self.combo_default_model.setStyleSheet(combo_style)
+        for model_code, model_label in ConfigManager.SUPPORTED_VIDEO_MODELS:
+            self.combo_default_model.addItem(model_label, model_code)
+        row2_layout.addWidget(self.combo_default_model, stretch=1)
+        gen_rules_layout.addLayout(row2_layout)
+        
+        lbl_gen_rules_hint = QLabel("💡 提示: 此处设置的间隔时间、生成模式（帧模式/素材模式）、尺寸比例（9:16/16:9）及模型（默认 Omni 1.1 Flash）将在复制/导出任务时自动同步给浏览器插件严格执行。")
+        lbl_gen_rules_hint.setWordWrap(True)
+        lbl_gen_rules_hint.setStyleSheet("color: #0284C7; font-style: italic; font-size: 11px;")
+        gen_rules_layout.addWidget(lbl_gen_rules_hint)
+        
+        main_layout.addWidget(group_gen_rules)
+        
         # Bottom Buttons
         bottom_layout = QHBoxLayout()
         btn_reset = QPushButton("🔄 恢复默认设置")
@@ -282,6 +364,7 @@ class SettingsDialog(QDialog):
     def load_data(self):
         self.spin_max_points.setValue(self.cm.max_batch_points)
         self.txt_marker.setText(getattr(self.cm, "forced_split_marker", "///"))
+        self.spin_min_segment_chars.setValue(getattr(self.cm, "min_segment_chars", 0))
         
         # Load char -> duration rules
         self.table_char_dur.setRowCount(0)
@@ -313,6 +396,21 @@ class SettingsDialog(QDialog):
             
         # Load end frame setting
         self.chk_default_enable_end_frame.setChecked(getattr(self.cm, "enable_end_frame", False))
+        
+        # Load video generation default rules
+        self.spin_task_interval.setValue(getattr(self.cm, "task_interval", 5))
+        
+        mode_code = getattr(self.cm, "default_generation_mode", "VIDEO_FRAMES")
+        idx_mode = self.combo_default_mode.findData(mode_code)
+        self.combo_default_mode.setCurrentIndex(idx_mode if idx_mode >= 0 else 0)
+        
+        aspect_code = getattr(self.cm, "default_aspect_ratio", "9:16")
+        idx_aspect = self.combo_default_aspect.findData(aspect_code)
+        self.combo_default_aspect.setCurrentIndex(idx_aspect if idx_aspect >= 0 else 0)
+        
+        model_code = getattr(self.cm, "default_video_model", "omni_1_1_flash")
+        idx_model = self.combo_default_model.findData(model_code)
+        self.combo_default_model.setCurrentIndex(idx_model if idx_model >= 0 else 0)
 
     def add_char_row(self):
         row = self.table_char_dur.rowCount()
@@ -352,6 +450,7 @@ class SettingsDialog(QDialog):
         # Read max batch points & forced split marker
         self.cm.max_batch_points = self.spin_max_points.value()
         self.cm.forced_split_marker = self.txt_marker.text().strip() or "///"
+        self.cm.min_segment_chars = self.spin_min_segment_chars.value()
         
         # Read char -> duration rules
         new_char_rules = []
@@ -404,6 +503,12 @@ class SettingsDialog(QDialog):
         
         # Read end frame setting
         self.cm.enable_end_frame = self.chk_default_enable_end_frame.isChecked()
+        
+        # Read video generation default rules
+        self.cm.task_interval = self.spin_task_interval.value()
+        self.cm.default_generation_mode = self.combo_default_mode.currentData() or "VIDEO_FRAMES"
+        self.cm.default_aspect_ratio = self.combo_default_aspect.currentData() or "9:16"
+        self.cm.default_video_model = self.combo_default_model.currentData() or "omni_1_1_flash"
         
         if self.cm.save():
             QMessageBox.information(self, "成功", "设置保存成功！已按新规则生效。")

@@ -8,20 +8,24 @@ class TemplateManager:
     
     TEMPLATES_FILE = "prompt_templates.json"
     MOTIONS_FILE = "camera_motions.json"
+    BATCH_TEMPLATES_FILE = "batch_templates.json"
     
     def __init__(self, workspace_dir):
         self.workspace_dir = Path(workspace_dir)
         self.templates_path = self.workspace_dir / self.TEMPLATES_FILE
         self.motions_path = self.workspace_dir / self.MOTIONS_FILE
+        self.batch_templates_path = self.workspace_dir / self.BATCH_TEMPLATES_FILE
         
         self.templates = []
         self.motions = []
+        self.batch_templates = []
         
         self.load_all()
 
     def load_all(self):
         self.load_templates()
         self.load_motions()
+        self.load_batch_templates()
 
     def load_templates(self):
         """Loads prompt templates from file. Initializes defaults or example if missing."""
@@ -250,3 +254,65 @@ class TemplateManager:
             if m["id"] == motion_id:
                 return m
         return None
+
+    def export_all(self, export_path):
+        """Exports all templates and motions to a single JSON file."""
+        try:
+            data = {
+                "templates": self.templates,
+                "motions": self.motions
+            }
+            with open(export_path, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=4, ensure_ascii=False)
+            return True, "导出成功"
+        except Exception as e:
+            return False, f"导出失败: {e}"
+
+    def import_all(self, import_path):
+        """Imports templates and motions from a single JSON file."""
+        try:
+            with open(import_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                
+            if "templates" in data and isinstance(data["templates"], list):
+                self.templates = data["templates"]
+            if "motions" in data and isinstance(data["motions"], list):
+                self.motions = data["motions"]
+                
+            self.save_templates()
+            self.save_motions()
+            return True, "导入成功"
+        except Exception as e:
+            return False, f"导入失败: {e}"
+
+    def load_batch_templates(self):
+        if self.batch_templates_path.exists():
+            try:
+                import json
+                with open(self.batch_templates_path, 'r', encoding='utf-8') as f:
+                    self.batch_templates = json.load(f)
+                if not self.batch_templates:
+                    self.init_default_batch_templates()
+            except Exception as e:
+                print(f'Error loading batch templates: {e}')
+                self.init_default_batch_templates()
+        else:
+            self.init_default_batch_templates()
+
+    def save_batch_templates(self):
+        try:
+            import json
+            with open(self.batch_templates_path, 'w', encoding='utf-8') as f:
+                json.dump(self.batch_templates, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            print(f'Error saving batch templates: {e}')
+
+    def init_default_batch_templates(self):
+        self.batch_templates = [
+            {
+                'id': 'bt-01',
+                'name': '默认批量模板',
+                'content': 'A high quality image.'
+            }
+        ]
+        self.save_batch_templates()

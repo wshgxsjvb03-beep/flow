@@ -10,12 +10,99 @@ from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel,
                              QPushButton, QTextEdit, QTableWidget, QTableWidgetItem, 
                              QHeaderView, QTabWidget, QListWidget, QListWidgetItem, 
                              QMessageBox, QSplitter, QLineEdit, QAbstractItemView, 
-                             QToolTip, QComboBox, QFrame, QDialog, QCheckBox, QScrollArea)
+                              QToolTip, QComboBox, QFrame, QDialog, QCheckBox, QScrollArea,
+                             QInputDialog, QMenu)
 from PyQt6.QtCore import Qt, pyqtSlot, QUrl, QTimer, QDateTime
 from PyQt6.QtGui import QDesktopServices, QGuiApplication, QCursor, QPixmap
 from models.project_model import ProjectModel
 from services.text_processor import TextProcessor
 from services.downloader import DownloadThread
+
+
+def flip_image_horizontally_replace(file_path) -> Path:
+    """
+    将指定图片进行左右水平翻转（镜像），用翻转后的新图片替换原图：
+    1. 读取原图并执行水平翻转，写入同目录下的临时新文件
+    2. 显式删除原有的旧图片文件 (unlink)
+    3. 将翻转后的新图片重命名为原图片的文件名（完全继承原文件名与扩展名）
+    """
+    import gc
+    import time
+    from PIL import Image, ImageOps
+
+    path = Path(file_path)
+    if not path.exists() or not path.is_file():
+        raise FileNotFoundError(f"图片文件不存在: {path}")
+
+    ext = path.suffix.lower()
+    valid_exts = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif"}
+    if ext not in valid_exts:
+        raise ValueError(f"仅支持翻转图片文件，当前格式不支持: {path.name}")
+
+    with Image.open(path) as img:
+        orig_format = img.format
+        transposed = ImageOps.exif_transpose(img)
+        flipped = transposed.transpose(Image.Transpose.FLIP_LEFT_RIGHT)
+        flipped.load()
+
+    tmp_path = path.with_name(f".flip_tmp_{int(time.time() * 1000)}_{os.getpid()}{path.suffix}")
+    try:
+        save_img = flipped
+        if ext in (".jpg", ".jpeg"):
+            if save_img.mode in ("RGBA", "LA", "P"):
+                save_img = save_img.convert("RGB")
+            save_img.save(tmp_path, format="JPEG", quality=95)
+        elif ext == ".png":
+            save_img.save(tmp_path, format="PNG")
+        elif ext == ".webp":
+            save_img.save(tmp_path, format="WEBP", quality=95)
+        elif ext == ".bmp":
+            if save_img.mode in ("RGBA", "LA", "P"):
+                save_img = save_img.convert("RGB")
+            save_img.save(tmp_path, format="BMP")
+        else:
+            save_img.save(tmp_path, format=orig_format or "PNG")
+
+        if not tmp_path.exists() or tmp_path.stat().st_size == 0:
+            raise RuntimeError("翻转后的新图片写入失败")
+
+        gc.collect()
+        if path.exists():
+            path.unlink()
+        tmp_path.rename(path)
+        return path
+    except Exception:
+        if tmp_path.exists():
+            try:
+                tmp_path.unlink()
+            except Exception:
+                pass
+        raise
+
+
+def encode_image_to_data_url(file_path) -> str:
+    """读取图片文件并编码为 Base64 Data URL。"""
+    import base64
+    path = Path(file_path)
+    if not path.exists() or not path.is_file():
+        return ""
+    ext = path.suffix.lower()
+    mime_map = {
+        ".jpg": "image/jpeg",
+        ".jpeg": "image/jpeg",
+        ".png": "image/png",
+        ".webp": "image/webp",
+        ".gif": "image/gif",
+        ".bmp": "image/bmp"
+    }
+    mime = mime_map.get(ext, "image/jpeg")
+    try:
+        raw = path.read_bytes()
+        b64 = base64.b64encode(raw).decode("ascii")
+        return f"data:{mime};base64,{b64}"
+    except Exception:
+        return ""
+
 
 class ProjectDetailWidget(QWidget):
     """Widget displaying detail and editing options for a selected project."""
@@ -462,12 +549,52 @@ class ProjectDetailWidget(QWidget):
         left_widget = QWidget()
         left_layout = QVBoxLayout(left_widget)
         left_layout.setContentsMargins(0, 0, 0, 0)
-        left_layout.addWidget(QLabel("下载的本地素材列表 (Double-click to open):"))
+        left_layout.addWidget(QLabel("下载的本地素材列表 (双击打开 / 可按住 Ctrl 或 Shift 多选):"))
         
         self.list_media = QListWidget()
+        self.list_media.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.list_media.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.list_media.customContextMenuRequested.connect(self.show_media_context_menu)
         self.list_media.doubleClicked.connect(self.open_media_file)
         self.list_media.currentItemChanged.connect(self.on_media_selection_changed)
         left_layout.addWidget(self.list_media)
+        
+        # Rename, Flip & Delete buttons
+        media_btn_layout = QHBoxLayout()
+        media_btn_layout.setSpacing(6)
+        
+        self.btn_flip_media = QPushButton("↔️ 左右翻转")
+        self.btn_flip_media.setToolTip("将选中的图片进行左右水平翻转，生成新图替换并删除原图（保留原文件名，支持多选）")
+        self.btn_flip_media.setStyleSheet("padding: 4px 10px; font-size: 12px; background-color: #0D9488; color: white; font-weight: bold;")
+        self.btn_flip_media.clicked.connect(self.flip_selected_media_files)
+        media_btn_layout.addWidget(self.btn_flip_media)
+        
+        self.btn_rename_media = QPushButton("✏️ 单个命名")
+        self.btn_rename_media.setToolTip("手动重命名选中的图片文件")
+        self.btn_rename_media.setStyleSheet("padding: 4px 10px; font-size: 12px;")
+        self.btn_rename_media.clicked.connect(self.rename_media_file)
+        media_btn_layout.addWidget(self.btn_rename_media)
+        
+        self.btn_auto_rename_media = QPushButton("🔄 一键命名")
+        self.btn_auto_rename_media.setToolTip("为本项目里的图片自动编号（紧接全局最大序号）")
+        self.btn_auto_rename_media.setStyleSheet("padding: 4px 10px; font-size: 12px; background-color: #6366F1; color: white; font-weight: bold;")
+        self.btn_auto_rename_media.clicked.connect(self.auto_rename_project_images)
+        media_btn_layout.addWidget(self.btn_auto_rename_media)
+        
+        self.btn_global_rename_media = QPushButton("🌐 全局命名")
+        self.btn_global_rename_media.setToolTip("将所有项目视为一个整体，从 1.jpg 开始全部重新编号")
+        self.btn_global_rename_media.setStyleSheet("padding: 4px 10px; font-size: 12px; background-color: #8B5CF6; color: white; font-weight: bold;")
+        self.btn_global_rename_media.clicked.connect(self.global_rename_all_images)
+        media_btn_layout.addWidget(self.btn_global_rename_media)
+        
+        self.btn_delete_media = QPushButton("🗑️ 删除")
+        self.btn_delete_media.setToolTip("删除选中的图片文件（会同步清除分句中对该文件的引用）")
+        self.btn_delete_media.setStyleSheet("padding: 4px 10px; font-size: 12px; color: #D32F2F;")
+        self.btn_delete_media.clicked.connect(self.delete_media_file)
+        media_btn_layout.addWidget(self.btn_delete_media)
+        
+        media_btn_layout.addStretch()
+        left_layout.addLayout(media_btn_layout)
         
         left_widget.setLayout(left_layout)
         splitter.addWidget(left_widget)
@@ -476,7 +603,15 @@ class ProjectDetailWidget(QWidget):
         right_widget = QWidget()
         right_layout = QVBoxLayout(right_widget)
         right_layout.setContentsMargins(0, 0, 0, 0)
-        right_layout.addWidget(QLabel("图片素材预览 (Preview):"))
+        preview_header_layout = QHBoxLayout()
+        preview_header_layout.addWidget(QLabel("图片素材预览 (Preview):"))
+        preview_header_layout.addStretch()
+        self.btn_flip_preview = QPushButton("↔️ 左右翻转当前图片")
+        self.btn_flip_preview.setToolTip("将当前预览的图片左右翻转，生成新图替换并删除原图（保留原文件名）")
+        self.btn_flip_preview.setStyleSheet("padding: 3px 10px; font-size: 12px; background-color: #0D9488; color: white; font-weight: bold;")
+        self.btn_flip_preview.clicked.connect(self.flip_selected_media_files)
+        preview_header_layout.addWidget(self.btn_flip_preview)
+        right_layout.addLayout(preview_header_layout)
         
         self.lbl_preview = QLabel("选择左侧素材以预览...")
         self.lbl_preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -1187,17 +1322,17 @@ class ProjectDetailWidget(QWidget):
                 from PIL import Image
                 from PyQt6.QtGui import QImage
                 
-                pil_img = Image.open(file_path)
-                # Convert to RGBA format for safe rendering in Qt
-                pil_img_rgba = pil_img.convert("RGBA")
-                width, height = pil_img_rgba.size
-                
-                # Convert PIL image bytes directly to QImage
-                raw_data = pil_img_rgba.tobytes("raw", "RGBA")
-                # QImage requires a reference to the bytes data to stay alive, or we copy it using .copy()
-                qimg = QImage(raw_data, width, height, QImage.Format.Format_RGBA8888).copy()
-                
-                pixmap = QPixmap.fromImage(qimg)
+                with Image.open(file_path) as pil_img:
+                    # Convert to RGBA format for safe rendering in Qt
+                    pil_img_rgba = pil_img.convert("RGBA")
+                    width, height = pil_img_rgba.size
+                    
+                    # Convert PIL image bytes directly to QImage
+                    raw_data = pil_img_rgba.tobytes("raw", "RGBA")
+                    # QImage requires a reference to the bytes data to stay alive, or we copy it using .copy()
+                    qimg = QImage(raw_data, width, height, QImage.Format.Format_RGBA8888).copy()
+                    
+                    pixmap = QPixmap.fromImage(qimg)
             except Exception as e:
                 print(f"Pillow load failed: {e}. Trying fallback direct loading...")
                 # 2. Fallback to direct loading
@@ -1228,6 +1363,285 @@ class ProjectDetailWidget(QWidget):
         else:
             self.lbl_preview.clear()
             self.lbl_preview.setText("文件不存在")
+
+    def show_media_context_menu(self, pos):
+        """Right-click context menu on list_media."""
+        item = self.list_media.itemAt(pos)
+        if not item:
+            return
+        menu = QMenu(self)
+        act_flip = menu.addAction("↔️ 左右翻转选中图片（替换并删除原图）")
+        act_rename = menu.addAction("✏️ 单个命名")
+        act_delete = menu.addAction("🗑️ 删除")
+        chosen = menu.exec(self.list_media.viewport().mapToGlobal(pos))
+        if chosen == act_flip:
+            self.flip_selected_media_files()
+        elif chosen == act_rename:
+            self.rename_media_file()
+        elif chosen == act_delete:
+            self.delete_media_file()
+
+    def flip_selected_media_files(self):
+        """
+        将资源管理中选中的图片进行左右水平翻转：
+        生成翻转后的新图片替换原来的老图片，继承原图片名称，并删除原图片文件。
+        """
+        if not self.project_path:
+            return
+
+        selected_items = self.list_media.selectedItems()
+        if not selected_items:
+            cur = self.list_media.currentItem()
+            if cur:
+                selected_items = [cur]
+
+        if not selected_items:
+            QMessageBox.warning(self, "提示", "请先在左侧列表中选择要翻转的图片文件（可按住 Ctrl 或 Shift 多选）。")
+            return
+
+        selected_names = []
+        for it in selected_items:
+            fn = it.data(Qt.ItemDataRole.UserRole)
+            if fn and fn not in selected_names:
+                selected_names.append(fn)
+
+        if not selected_names:
+            return
+
+        current_item = self.list_media.currentItem()
+        current_name = current_item.data(Qt.ItemDataRole.UserRole) if current_item else selected_names[0]
+
+        # 先释放预览可能占用的引用
+        self.lbl_preview.clear()
+
+        flipped_ok = []
+        flipped_err = []
+        downloads_dir = self.project_path / "downloads"
+
+        for fn in selected_names:
+            fp = downloads_dir / fn
+            try:
+                flip_image_horizontally_replace(fp)
+                flipped_ok.append(fn)
+            except Exception as e:
+                flipped_err.append(f"{fn}: {e}")
+
+        # 更新列表项显示的大小并保持选中状态
+        for i in range(self.list_media.count()):
+            it = self.list_media.item(i)
+            fn = it.data(Qt.ItemDataRole.UserRole)
+            if fn in flipped_ok:
+                fp = downloads_dir / fn
+                if fp.exists():
+                    size_kb = fp.stat().st_size / 1024
+                    it.setText(f"{fp.name} ({size_kb:.1f} KB)")
+
+        # 刷新右侧大图预览
+        self.on_media_selection_changed(self.list_media.currentItem(), None)
+
+        # 刷新工作台属性面板中的下拉框缩略图与当前首/尾帧预览
+        if hasattr(self, "combo_prop_image"):
+            self.refresh_prop_image_combo_items()
+            cur_prop_img = self.combo_prop_image.currentData()
+            if cur_prop_img in flipped_ok:
+                self.update_prop_image_preview(cur_prop_img)
+        if hasattr(self, "combo_prop_end_image"):
+            cur_prop_end_img = self.combo_prop_end_image.currentData()
+            if cur_prop_end_img in flipped_ok:
+                self.update_prop_end_image_preview(cur_prop_end_img)
+
+        if flipped_ok:
+            names_preview = "、".join(flipped_ok[:5]) + ("..." if len(flipped_ok) > 5 else "")
+            self.lbl_download_status.setText(f"状态: ✅ 已左右翻转并替换原图 ({len(flipped_ok)} 张): {names_preview}")
+
+        if flipped_err:
+            QMessageBox.warning(
+                self, "部分翻转失败",
+                f"成功翻转 {len(flipped_ok)} 张，失败 {len(flipped_err)} 张：\n\n" + "\n".join(flipped_err[:10])
+            )
+        elif len(flipped_ok) > 1:
+            QMessageBox.information(
+                self, "批量翻转完成",
+                f"已成功将选中的 {len(flipped_ok)} 张图片左右翻转！\n\n新图片已替换并删除原图（保留原文件名）。"
+            )
+
+    def rename_media_file(self):
+        """Renames the selected media file and updates all segment references."""
+        current_item = self.list_media.currentItem()
+        if not current_item:
+            QMessageBox.warning(self, "提示", "请先在左侧列表中选择要重命名的文件。")
+            return
+        
+        old_name = current_item.data(Qt.ItemDataRole.UserRole)
+        if not old_name:
+            return
+        
+        old_path = self.project_path / "downloads" / old_name
+        if not old_path.exists():
+            QMessageBox.warning(self, "提示", f"文件不存在: {old_name}")
+            return
+        
+        # Get the file extension
+        old_suffix = old_path.suffix
+        old_stem = old_path.stem
+        
+        # Ask user for new name (without extension)
+        new_stem, ok = QInputDialog.getText(
+            self, "重命名文件", 
+            f"当前文件名: {old_name}\n\n请输入新文件名（不含扩展名）:",
+            QLineEdit.EchoMode.Normal, old_stem
+        )
+        
+        if not ok or not new_stem.strip():
+            return
+        
+        new_stem = new_stem.strip()
+        # Sanitize: remove invalid filename characters
+        invalid_chars = '<>:"/\\|?*'
+        for ch in invalid_chars:
+            new_stem = new_stem.replace(ch, '_')
+        
+        new_name = new_stem + old_suffix
+        new_path = self.project_path / "downloads" / new_name
+        
+        if new_name == old_name:
+            return  # No change
+        
+        if new_path.exists():
+            QMessageBox.warning(self, "重命名失败", f"目标文件名已存在: {new_name}\n请使用其他名称。")
+            return
+        
+        try:
+            old_path.rename(new_path)
+        except Exception as e:
+            QMessageBox.critical(self, "重命名失败", f"无法重命名文件:\n{e}")
+            return
+        
+        # Update all segment references (image_name, end_image_name)
+        updated_count = 0
+        if self.project_model and self.project_model.spanish_segments:
+            for seg in self.project_model.spanish_segments:
+                if seg.get("image_name") == old_name:
+                    seg["image_name"] = new_name
+                    updated_count += 1
+                if seg.get("end_image_name") == old_name:
+                    seg["end_image_name"] = new_name
+                    updated_count += 1
+            # Save updated metadata
+            self.project_model.save()
+        
+        # Refresh UI
+        self.refresh_media_list()
+        self.populate_segments_table()
+        
+        msg = f"文件已重命名: {old_name} → {new_name}"
+        if updated_count > 0:
+            msg += f"\n\n同时更新了 {updated_count} 处分句素材关联引用。"
+        QMessageBox.information(self, "重命名成功", msg)
+
+    def auto_rename_project_images(self):
+        """Automatically rename all images in the project based on the rule."""
+        if not self.project_model:
+            return
+            
+        reply = QMessageBox.question(
+            self, "确认一键重命名",
+            "是否要为本项目里的图片进行自动编号？\n\n(将紧接全局已有的最大序号往后命名)",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No
+        )
+        if reply == QMessageBox.StandardButton.Yes:
+            try:
+                renamed_count = self.project_model.rename_images()
+                self.project_model.update_media_files()
+                self.refresh_media_list()
+                self.populate_segments_table()
+                QMessageBox.information(self, "完成", f"重命名完成，共重命名了 {renamed_count} 张图片！")
+            except Exception as e:
+                QMessageBox.critical(self, "错误", f"重命名失败: {e}")
+
+    def global_rename_all_images(self):
+        """Triggers the global batch rename for all projects."""
+        main_win = self.window()
+        if hasattr(main_win, "batch_rename_all_images"):
+            main_win.batch_rename_all_images()
+        else:
+            QMessageBox.warning(self, "提示", "主窗口未提供该功能。")
+
+    def delete_media_file(self):
+        """Deletes the selected media file and clears all segment references to it."""
+        current_item = self.list_media.currentItem()
+        if not current_item:
+            QMessageBox.warning(self, "提示", "请先在左侧列表中选择要删除的文件。")
+            return
+        
+        filename = current_item.data(Qt.ItemDataRole.UserRole)
+        if not filename:
+            return
+        
+        file_path = self.project_path / "downloads" / filename
+        if not file_path.exists():
+            QMessageBox.warning(self, "提示", f"文件不存在: {filename}")
+            self.refresh_media_list()
+            return
+        
+        # Check how many segments reference this file
+        ref_count = 0
+        if self.project_model and self.project_model.spanish_segments:
+            for seg in self.project_model.spanish_segments:
+                if seg.get("image_name") == filename:
+                    ref_count += 1
+                if seg.get("end_image_name") == filename:
+                    ref_count += 1
+        
+        # Confirmation dialog
+        ref_warning = ""
+        if ref_count > 0:
+            ref_warning = f"\n\n⚠️ 注意: 有 {ref_count} 处分句正在引用此文件作为素材，删除后将自动清除这些关联。"
+        
+        size_kb = file_path.stat().st_size / 1024
+        res = QMessageBox.question(
+            self, "确认删除",
+            f"确定要删除以下文件吗？\n\n"
+            f"文件名: {filename}\n"
+            f"文件大小: {size_kb:.1f} KB"
+            f"{ref_warning}",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No
+        )
+        
+        if res != QMessageBox.StandardButton.Yes:
+            return
+        
+        try:
+            file_path.unlink()
+        except Exception as e:
+            QMessageBox.critical(self, "删除失败", f"无法删除文件:\n{e}")
+            return
+        
+        # Clear all segment references to this file
+        cleared_count = 0
+        if self.project_model and self.project_model.spanish_segments:
+            for seg in self.project_model.spanish_segments:
+                if seg.get("image_name") == filename:
+                    seg["image_name"] = ""
+                    cleared_count += 1
+                if seg.get("end_image_name") == filename:
+                    seg["end_image_name"] = ""
+                    cleared_count += 1
+            # Save updated metadata
+            self.project_model.save()
+        
+        # Refresh UI
+        self.lbl_preview.clear()
+        self.lbl_preview.setText("选择左侧素材以预览...")
+        self.refresh_media_list()
+        self.populate_segments_table()
+        
+        msg = f"文件已删除: {filename}"
+        if cleared_count > 0:
+            msg += f"\n已清除 {cleared_count} 处分句素材关联引用。"
+        QMessageBox.information(self, "删除成功", msg)
 
     def refresh_template_comboboxes(self):
         """Loads prompt templates and motions lists into dropdown selectors."""
@@ -1467,6 +1881,7 @@ class ProjectDetailWidget(QWidget):
         # Mode selector
         panel_layout.addWidget(QLabel("⚙️ 生成模式:"))
         self.combo_prop_mode = QComboBox()
+        self.combo_prop_mode.addItem("-- 遵循规则设置 --", "")
         self.combo_prop_mode.addItem("帧模式 (First Frame)", "VIDEO_FRAMES")
         self.combo_prop_mode.addItem("素材模式 (Reference)", "VIDEO_REFERENCES")
         self.combo_prop_mode.currentIndexChanged.connect(self.on_prop_mode_changed)
@@ -1718,8 +2133,11 @@ class ProjectDetailWidget(QWidget):
         else:
             self.combo_prop_motion.setCurrentIndex(0)
             
-        # Select current mode
-        mode = seg.get("mode", "VIDEO_FRAMES")
+        # Select current mode (only if explicitly overridden via mode_overridden)
+        if seg.get("mode_overridden") and seg.get("mode"):
+            mode = seg.get("mode", "")
+        else:
+            mode = ""
         mode_idx = self.combo_prop_mode.findData(mode)
         if mode_idx >= 0:
             self.combo_prop_mode.setCurrentIndex(mode_idx)
@@ -1785,13 +2203,13 @@ class ProjectDetailWidget(QWidget):
         try:
             from PIL import Image
             # Use PIL to read image and scale it to a small thumbnail, e.g. 24x24 px
-            pil_img = Image.open(file_path)
-            pil_img.thumbnail((24, 24))
-            pil_img_rgba = pil_img.convert("RGBA")
-            width, height = pil_img_rgba.size
-            raw_data = pil_img_rgba.tobytes("raw", "RGBA")
-            qimg = QImage(raw_data, width, height, QImage.Format.Format_RGBA8888).copy()
-            pixmap = QPixmap.fromImage(qimg)
+            with Image.open(file_path) as pil_img:
+                pil_img.thumbnail((24, 24))
+                pil_img_rgba = pil_img.convert("RGBA")
+                width, height = pil_img_rgba.size
+                raw_data = pil_img_rgba.tobytes("raw", "RGBA")
+                qimg = QImage(raw_data, width, height, QImage.Format.Format_RGBA8888).copy()
+                pixmap = QPixmap.fromImage(qimg)
             return QIcon(pixmap)
         except Exception:
             return QIcon()
@@ -1811,13 +2229,13 @@ class ProjectDetailWidget(QWidget):
         try:
             from PIL import Image
             from PyQt6.QtGui import QImage, QPixmap
-            pil_img = Image.open(file_path)
-            pil_img.thumbnail((220, 150))
-            pil_img_rgba = pil_img.convert("RGBA")
-            width, height = pil_img_rgba.size
-            raw_data = pil_img_rgba.tobytes("raw", "RGBA")
-            qimg = QImage(raw_data, width, height, QImage.Format.Format_RGBA8888).copy()
-            pixmap = QPixmap.fromImage(qimg)
+            with Image.open(file_path) as pil_img:
+                pil_img.thumbnail((220, 150))
+                pil_img_rgba = pil_img.convert("RGBA")
+                width, height = pil_img_rgba.size
+                raw_data = pil_img_rgba.tobytes("raw", "RGBA")
+                qimg = QImage(raw_data, width, height, QImage.Format.Format_RGBA8888).copy()
+                pixmap = QPixmap.fromImage(qimg)
             self.lbl_prop_preview.setPixmap(pixmap)
         except Exception as e:
             print(f"Error loading preview: {e}")
@@ -1841,13 +2259,13 @@ class ProjectDetailWidget(QWidget):
         try:
             from PIL import Image
             from PyQt6.QtGui import QImage, QPixmap
-            pil_img = Image.open(file_path)
-            pil_img.thumbnail((220, 150))
-            pil_img_rgba = pil_img.convert("RGBA")
-            width, height = pil_img_rgba.size
-            raw_data = pil_img_rgba.tobytes("raw", "RGBA")
-            qimg = QImage(raw_data, width, height, QImage.Format.Format_RGBA8888).copy()
-            pixmap = QPixmap.fromImage(qimg)
+            with Image.open(file_path) as pil_img:
+                pil_img.thumbnail((220, 150))
+                pil_img_rgba = pil_img.convert("RGBA")
+                width, height = pil_img_rgba.size
+                raw_data = pil_img_rgba.tobytes("raw", "RGBA")
+                qimg = QImage(raw_data, width, height, QImage.Format.Format_RGBA8888).copy()
+                pixmap = QPixmap.fromImage(qimg)
             self.lbl_prop_end_preview.setPixmap(pixmap)
         except Exception as e:
             print(f"Error loading end preview: {e}")
@@ -1897,7 +2315,14 @@ class ProjectDetailWidget(QWidget):
             return
             
         mode = self.combo_prop_mode.currentData()
-        self.project_model.spanish_segments[row]["mode"] = mode if mode else "VIDEO_FRAMES"
+        if mode:
+            self.project_model.spanish_segments[row]["mode"] = mode
+            self.project_model.spanish_segments[row]["mode_overridden"] = True
+        else:
+            default_mode = getattr(self.config_manager, "default_generation_mode", "VIDEO_FRAMES") if self.config_manager else "VIDEO_FRAMES"
+            self.project_model.spanish_segments[row]["mode"] = default_mode
+            self.project_model.spanish_segments[row]["mode_overridden"] = False
+        self.project_model.save()
 
     def refresh_table_row_index_label(self, row):
         if not self.project_model or row < 0 or row >= len(self.project_model.spanish_segments):
@@ -1985,6 +2410,11 @@ class ProjectDetailWidget(QWidget):
                 
         self.combo_prop_template.blockSignals(False)
         self.combo_prop_motion.blockSignals(False)
+        
+        if hasattr(self, "combo_prop_mode") and self.combo_prop_mode.count() > 0:
+            default_mode_code = getattr(self.config_manager, "default_generation_mode", "VIDEO_FRAMES") if self.config_manager else "VIDEO_FRAMES"
+            default_mode_name = "素材模式" if default_mode_code == "VIDEO_REFERENCES" else "帧模式"
+            self.combo_prop_mode.setItemText(0, f"-- 遵循规则设置 ({default_mode_name}) --")
 
     def on_prop_template_changed(self):
         row = getattr(self, "current_prop_row", -1)
@@ -2060,6 +2490,7 @@ class ProjectDetailWidget(QWidget):
             for seg in self.project_model.spanish_segments:
                 seg["template_id"] = ""
                 seg["motion_id"] = ""
+                seg["mode_overridden"] = False
             self.project_model.save()
             self.refresh_prop_template_motion_combos()
             self.populate_segments_table()
@@ -2067,20 +2498,33 @@ class ProjectDetailWidget(QWidget):
 
     def export_batch_json(self):
         """Generates task list JSON and opens batch copy dialog partitioned by points budget <= 50."""
-        if not self.project_model:
-            QMessageBox.warning(self, "提示", "请先打开一个工程项目。")
+        res = self.build_batches()
+        if res.get("error"):
+            level = res.get("level", "warning")
+            if level == "info":
+                QMessageBox.information(self, "提示", res["error"])
+            else:
+                QMessageBox.warning(self, "提示", res["error"])
             return
+        dialog = BatchExportDialog(self, res["batches"], self.config_manager, skipped_count=res["skipped"])
+        dialog.exec()
+
+    def build_batches(self):
+        """
+        按积分上限把当前项目未完成的分句拆成批次（与「导出批量 JSON」完全同一套逻辑）。
+        返回 {"batches": [[task,...],...], "skipped": int, "error": str, "level": "warning"/"info"}
+        """
+        if not self.project_model:
+            return {"batches": [], "skipped": 0, "error": "请先打开一个工程项目。"}
             
         segments = self.project_model.spanish_segments
         if not segments:
-            QMessageBox.warning(self, "提示", "当前项目没有西文分句，无法生成任务。")
-            return
+            return {"batches": [], "skipped": 0, "error": "当前项目没有西文分句，无法生成任务。"}
             
         # 1. Check prompt template selection
         tpl_id = self.combo_templates.currentData()
         if not tpl_id:
-            QMessageBox.warning(self, "提示", "导出失败：请先选择提示词模板！")
-            return
+            return {"batches": [], "skipped": 0, "error": "导出失败：请先选择提示词模板！"}
             
         # 2. Check image material association for all segments
         missing_image_rows = []
@@ -2090,13 +2534,11 @@ class ProjectDetailWidget(QWidget):
                 
         if missing_image_rows:
             if len(missing_image_rows) == len(segments):
-                QMessageBox.warning(self, "提示", "导出失败：句段尚未关联图片素材，请先选择关联图片素材！")
-            else:
-                rows_str = "、".join([f"第 {r} 句" for r in missing_image_rows[:5]])
-                if len(missing_image_rows) > 5:
-                    rows_str += f" 等 {len(missing_image_rows)} 句"
-                QMessageBox.warning(self, "提示", f"导出失败：{rows_str} 尚未关联图片素材，请先选择关联图片素材！")
-            return
+                return {"batches": [], "skipped": 0, "error": "导出失败：句段尚未关联图片素材，请先选择关联图片素材！"}
+            rows_str = "、".join([f"第 {r} 句" for r in missing_image_rows[:5]])
+            if len(missing_image_rows) > 5:
+                rows_str += f" 等 {len(missing_image_rows)} 句"
+            return {"batches": [], "skipped": 0, "error": f"导出失败：{rows_str} 尚未关联图片素材，请先选择关联图片素材！"}
             
         all_tasks = []
         skipped_copied_count = 0
@@ -2134,7 +2576,15 @@ class ProjectDetailWidget(QWidget):
             final_prompt = re.sub(r' +', ' ', final_prompt).strip()
             
             image_name = seg.get("image_name", "")
-            mode = seg.get("mode", "VIDEO_FRAMES")
+            default_mode = getattr(self.config_manager, "default_generation_mode", "VIDEO_FRAMES") if self.config_manager else "VIDEO_FRAMES"
+            default_aspect = getattr(self.config_manager, "default_aspect_ratio", "9:16") if self.config_manager else "9:16"
+            default_model = getattr(self.config_manager, "default_video_model", "omni_1_1_flash") if self.config_manager else "omni_1_1_flash"
+            task_interval = getattr(self.config_manager, "task_interval", 5) if self.config_manager else 5
+            
+            if seg.get("mode_overridden") and seg.get("mode") in ("VIDEO_FRAMES", "VIDEO_REFERENCES"):
+                mode = seg.get("mode")
+            else:
+                mode = default_mode
             duration = seg.get("duration", 6)
             
             local_image_path = ""
@@ -2151,6 +2601,9 @@ class ProjectDetailWidget(QWidget):
             task_dict = {
                 "prompt": final_prompt,
                 "mode": mode,
+                "aspect_ratio": default_aspect,
+                "model": default_model,
+                "interval": task_interval,
                 "image_name": image_name,
                 "local_image_path": local_image_path,
                 "duration": duration,
@@ -2167,15 +2620,11 @@ class ProjectDetailWidget(QWidget):
 
         if not all_tasks:
             if skipped_copied_count > 0:
-                QMessageBox.information(
-                    self, "提示", 
+                return {"batches": [], "skipped": skipped_copied_count, "level": "info", "error": (
                     f"所有 {skipped_copied_count} 个分句均已手动复制/生成过（已变绿标结）。\n"
                     "已自动排除这些片段，没有需要新导出的任务！\n\n"
-                    "💡 如需重新导出，请在表格中双击对应句子的【秒数】列取消已完成标绿即可。"
-                )
-            else:
-                QMessageBox.warning(self, "提示", "当前项目没有可导出的有效分句。")
-            return
+                    "💡 如需重新导出，请在表格中双击对应句子的【秒数】列取消已完成标绿即可。")}
+            return {"batches": [], "skipped": 0, "error": "当前项目没有可导出的有效分句。"}
             
         # Partition tasks using First Fit Decreasing (FFD) to maximize points utilization per batch
         batches = []
@@ -2213,9 +2662,7 @@ class ProjectDetailWidget(QWidget):
         for batch in batches:
             batch.sort(key=lambda t: t["_original_index"])
             
-        # Open the batch copy dialog
-        dialog = BatchExportDialog(self, batches, self.config_manager, skipped_count=skipped_copied_count)
-        dialog.exec()
+        return {"batches": batches, "skipped": skipped_copied_count, "error": ""}
 
     def open_settings_dialog(self):
         """Opens rules and points settings dialog."""
@@ -2228,6 +2675,7 @@ class ProjectDetailWidget(QWidget):
         if self.config_manager:
             dialog = SettingsDialog(self.config_manager, self)
             if dialog.exec() == QDialog.DialogCode.Accepted:
+                self.refresh_prop_template_motion_combos()
                 self.populate_segments_table()
 
     def check_video_completeness(self):
@@ -2659,7 +3107,16 @@ class ProjectDetailWidget(QWidget):
             
             image_name, local_image_path, image_data_url = self.resolve_segment_image_and_data(idx, seg)
             end_image_name, end_local_image_path, end_image_data_url = self.resolve_segment_end_image_and_data(idx, seg)
-            mode = seg.get("mode", "VIDEO_FRAMES")
+            
+            default_mode = getattr(self.config_manager, "default_generation_mode", "VIDEO_FRAMES") if self.config_manager else "VIDEO_FRAMES"
+            default_aspect = getattr(self.config_manager, "default_aspect_ratio", "9:16") if self.config_manager else "9:16"
+            default_model = getattr(self.config_manager, "default_video_model", "omni_1_1_flash") if self.config_manager else "omni_1_1_flash"
+            task_interval = getattr(self.config_manager, "task_interval", 5) if self.config_manager else 5
+            
+            if seg.get("mode_overridden") and seg.get("mode") in ("VIDEO_FRAMES", "VIDEO_REFERENCES"):
+                mode = seg.get("mode")
+            else:
+                mode = default_mode
             duration = seg.get("duration", 6)
                 
             videos_dir = self.project_path / "downloads" / "videos" if self.project_path else Path("downloads/videos")
@@ -2670,6 +3127,9 @@ class ProjectDetailWidget(QWidget):
                 "index": idx,
                 "prompt": final_prompt,
                 "mode": mode,
+                "aspect_ratio": default_aspect,
+                "model": default_model,
+                "interval": task_interval,
                 "image_name": image_name,
                 "local_image_path": local_image_path,
                 "image_data_url": image_data_url,
@@ -2895,13 +3355,28 @@ class BatchExportDialog(QDialog):
         total_end_frames = sum(sum(1 for t in b if t.get("end_image_name")) for b in self.batches)
         max_pts = self.cm.max_batch_points if self.cm else 50
         
+        default_mode_code = getattr(self.cm, "default_generation_mode", "VIDEO_FRAMES") if self.cm else "VIDEO_FRAMES"
+        default_mode_label = "素材模式 (Ingredients)" if default_mode_code == "VIDEO_REFERENCES" else "帧模式 (First Frame)"
+        default_aspect = getattr(self.cm, "default_aspect_ratio", "9:16") if self.cm else "9:16"
+        default_model_code = getattr(self.cm, "default_video_model", "omni_1_1_flash") if self.cm else "omni_1_1_flash"
+        model_map = {
+            "omni_1_1_flash": "Omni 1.1 Flash",
+            "veo_3_1_lite": "Veo 3.1 - Lite",
+            "veo_3_1_fast": "Veo 3.1 - Fast",
+            "veo_3_1_quality": "Veo 3.1 - Quality",
+            "veo_3_1_lite_low_priority": "Veo 3.1 - Lite [Lower Priority]"
+        }
+        default_model_label = model_map.get(default_model_code, default_model_code)
+        task_interval = getattr(self.cm, "task_interval", 5) if self.cm else 5
+        
         skipped_text = f" <span style='color: #10B981;'>(已自动排除 {self.skipped_count} 个已生成的变绿片段)</span>" if self.skipped_count > 0 else ""
         end_stat_text = f" | 🎬 包含 <b>{total_end_frames}</b> 个配置尾帧的分句" if total_end_frames > 0 else ""
         
         lbl_summary = QLabel(
             f"📊 <b>统计信息</b>：共 <b>{total_segments}</b> 个待生成视频片段{skipped_text}{end_stat_text}，"
             f"总需 <b>{total_points}</b> 积分。<br/>"
-            f"每批次上限为 <b>{max_pts}</b> 积分，已拆为 <b>{len(self.batches)}</b> 个批次。"
+            f"每批次上限为 <b>{max_pts}</b> 积分，已拆为 <b>{len(self.batches)}</b> 个批次。<br/>"
+            f"<span style='color: #0284C7;'>⚙️ <b>当前生成规则</b>：模式=<b>{default_mode_label}</b> | 尺寸=<b>{default_aspect}</b> | 模型=<b>{default_model_label}</b> | 任务间隔=<b>{task_interval}秒</b></span>"
         )
         lbl_summary.setStyleSheet("font-size: 13px; color: #5D4037;")
         layout.addWidget(lbl_summary)
@@ -2910,9 +3385,32 @@ class BatchExportDialog(QDialog):
         quick_bar = QHBoxLayout()
         quick_bar.setSpacing(8)
         
-        lbl_quick_hint = QLabel("💡 插件表格对接：")
+        lbl_quick_hint = QLabel("💡 快捷导出：")
         lbl_quick_hint.setStyleSheet("font-size: 12px; color: #78350F; font-weight: bold;")
         quick_bar.addWidget(lbl_quick_hint)
+
+        btn_copy_all_vids = QPushButton(f"🎬 复制全部任务 JSON (Vids 无积分限制 · 共 {total_segments} 条)")
+        btn_copy_all_vids.setToolTip(
+            f"Google Vids 没有 50 积分限制！\n"
+            f"点击一键复制全部 {total_segments} 条待生成分镜的完整 JSON（自动保持原始时长不降级）。\n"
+            "复制后切换到 Google Vids 页面点击悬浮胶囊的【🎬】按钮即可自动逐个上传图片、生成并下载视频！"
+        )
+        btn_copy_all_vids.setStyleSheet("""
+            QPushButton {
+                background-color: #2563EB;
+                color: white;
+                border: none;
+                border-radius: 4px;
+                padding: 6px 12px;
+                font-size: 11px;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background-color: #1D4ED8;
+            }
+        """)
+        btn_copy_all_vids.clicked.connect(lambda: self.copy_all_vids_json(btn_copy_all_vids))
+        quick_bar.addWidget(btn_copy_all_vids)
         
         btn_copy_all_end = QPushButton(f"🎬 复制全部待生成尾帧列 (共 {total_segments} 行)")
         btn_copy_all_end.setToolTip(
@@ -3012,52 +3510,40 @@ class BatchExportDialog(QDialog):
                 }
             """)
             btn_copy.clicked.connect(self.make_copy_callback(idx, btn_copy))
+            btn_copy.setMinimumHeight(34)
+            btn_copy.setMinimumWidth(130)
             btns_layout.addWidget(btn_copy)
-            
-            btn_copy_end = QPushButton("🎬 复制尾帧列")
-            btn_copy_end.setToolTip(
-                f"按本批分镜顺序将 {len(batch)} 行尾帧图片名复制为多行文本。\n"
-                "在插件表格第1行【尾帧图片名】按 Ctrl+V 即可整列填满！"
-            )
-            btn_copy_end.setStyleSheet("""
-                QPushButton {
-                    background-color: #F59E0B;
-                    color: white;
-                    border: none;
-                    border-radius: 4px;
-                    padding: 6px 10px;
-                    font-size: 11px;
-                    font-weight: bold;
-                }
-                QPushButton:hover {
-                    background-color: #D97706;
-                }
-            """)
-            btn_copy_end.clicked.connect(self.make_copy_end_callback(idx, btn_copy_end))
-            btns_layout.addWidget(btn_copy_end)
 
-            btn_copy_tsv = QPushButton("📊 表格TSV")
-            btn_copy_tsv.setToolTip(f"按 [序号 \\t 首帧图名 \\t 尾帧图名 \\t 分镜名] 复制本批 {len(batch)} 行制表符数据")
-            btn_copy_tsv.setStyleSheet("""
+            btn_copy_imgs = QPushButton("🖼️ 复制图片路径")
+            btn_copy_imgs.setToolTip(
+                f"复制本批 {len(batch)} 个分镜所用的图片完整路径，格式如：\n"
+                "D:\\路径\\downloads\\\"01.jpeg\" \"02.jpeg\"\n"
+                "可直接粘贴到 Flow 文件管理器中上传"
+            )
+            btn_copy_imgs.setStyleSheet("""
                 QPushButton {
-                    background-color: #0284C7;
+                    background-color: #059669;
                     color: white;
                     border: none;
                     border-radius: 4px;
-                    padding: 6px 10px;
+                    padding: 6px 12px;
                     font-size: 11px;
                     font-weight: bold;
                 }
                 QPushButton:hover {
-                    background-color: #0369A1;
+                    background-color: #047857;
                 }
             """)
-            btn_copy_tsv.clicked.connect(self.make_copy_tsv_callback(idx, btn_copy_tsv))
-            btns_layout.addWidget(btn_copy_tsv)
+            btn_copy_imgs.clicked.connect(self.make_copy_images_callback(idx, btn_copy_imgs))
+            btn_copy_imgs.setMinimumHeight(34)
+            btn_copy_imgs.setMinimumWidth(130)
+            btns_layout.addWidget(btn_copy_imgs)
             
             widget_layout.addLayout(btns_layout)
             widget.setLayout(widget_layout)
-            item.setSizeHint(widget.sizeHint())
+            hint = widget.sizeHint()
+            hint.setHeight(max(hint.height(), 64))
+            item.setSizeHint(hint)
             self.list_batches.setItemWidget(item, widget)
             
         layout.addWidget(self.list_batches)
@@ -3196,6 +3682,47 @@ class BatchExportDialog(QDialog):
             from PyQt6.QtWidgets import QMessageBox
             QMessageBox.critical(self, "错误", f"复制TSV表格失败: {e}")
 
+    def copy_all_vids_json(self, button):
+        """Copies all tasks across all batches as a single chronological JSON array for Google Vids (no 50-credit limit)."""
+        import json
+        all_tasks = [task for batch in self.batches for task in batch]
+        all_tasks.sort(key=lambda t: t.get("_original_index", 0))
+
+        cleaned_all = []
+        for item in all_tasks:
+            c_item = {k: v for k, v in item.items() if not k.startswith("_")}
+            if "_raw_duration" in item:
+                c_item["duration"] = item["_raw_duration"]
+            cleaned_all.append(c_item)
+
+        try:
+            json_str = json.dumps(cleaned_all, indent=2, ensure_ascii=False)
+            from PyQt6.QtGui import QGuiApplication, QCursor
+            from PyQt6.QtWidgets import QToolTip
+            clipboard = QGuiApplication.clipboard()
+            clipboard.setText(json_str)
+
+            button.setText(f"✓ 已复制全部 {len(cleaned_all)} 条 (Vids)")
+            button.setStyleSheet("""
+                QPushButton {
+                    background-color: #10B981;
+                    color: white;
+                    border: none;
+                    border-radius: 4px;
+                    padding: 6px 12px;
+                    font-size: 11px;
+                    font-weight: bold;
+                }
+            """)
+            msg = (
+                f"✓ 已复制全部 {len(cleaned_all)} 条待生成任务 JSON（无 50 积分限制）！\n"
+                "现在只需切换到 Google Vids 页面，点击插件悬浮胶囊的【🎬】按钮即可自动逐条上传图片、生成并下载视频！"
+            )
+            QToolTip.showText(QCursor.pos(), msg, button)
+        except Exception as e:
+            from PyQt6.QtWidgets import QMessageBox
+            QMessageBox.critical(self, "错误", f"复制全部 Vids 任务 JSON 失败: {e}")
+
     def copy_all_end_frames(self, button):
         all_tasks = [task for batch in self.batches for task in batch]
         self.copy_end_frames_column(all_tasks, button, desc="全部")
@@ -3203,4 +3730,70 @@ class BatchExportDialog(QDialog):
     def copy_all_tsv(self, button):
         all_tasks = [task for batch in self.batches for task in batch]
         self.copy_tsv_table(all_tasks, button, desc="全部")
+
+    def make_copy_images_callback(self, batch_idx, button):
+        return lambda: self.copy_image_paths(batch_idx, button)
+
+    def copy_image_paths(self, batch_idx, button):
+        """Copies deduplicated image file paths for a batch in the format:
+        D:\\path\\downloads\\"01.jpeg" "02.jpeg" "03.jpeg"
+        """
+        batch = self.batches[batch_idx]
+        
+        # Collect unique image names while preserving order
+        seen = set()
+        unique_images = []
+        for item in batch:
+            img = item.get("image_name", "").strip()
+            if img and img not in seen:
+                seen.add(img)
+                unique_images.append(img)
+            # Also include end_image_name if present
+            end_img = item.get("end_image_name", "").strip()
+            if end_img and end_img not in seen:
+                seen.add(end_img)
+                unique_images.append(end_img)
+        
+        if not unique_images:
+            from PyQt6.QtWidgets import QMessageBox
+            QMessageBox.warning(self, "提示", "本批次没有关联图片素材！")
+            return
+        
+        # Get the downloads directory from any task's local_image_path
+        downloads_dir = ""
+        for item in batch:
+            local_path = item.get("local_image_path", "")
+            if local_path:
+                downloads_dir = str(Path(local_path).parent)
+                break
+        
+        # Build the output string: D:\path\downloads\"01.jpeg" "02.jpeg"
+        quoted_names = " ".join(f'"{img}"' for img in unique_images)
+        result = f'{downloads_dir}\\{quoted_names}' if downloads_dir else quoted_names
+        
+        try:
+            from PyQt6.QtGui import QGuiApplication, QCursor
+            from PyQt6.QtWidgets import QToolTip
+            clipboard = QGuiApplication.clipboard()
+            clipboard.setText(result)
+            
+            button.setText("✓ 已复制路径")
+            button.setStyleSheet("""
+                QPushButton {
+                    background-color: #059669;
+                    color: white;
+                    border: none;
+                    border-radius: 4px;
+                    padding: 6px 10px;
+                    font-size: 11px;
+                    font-weight: bold;
+                }
+            """)
+            msg = (f"✓ 已复制第 {batch_idx + 1} 批共 {len(unique_images)} 张图片路径！\n"
+                   f"格式：{downloads_dir}\\\"图片名\" ...\n"
+                   "可直接粘贴到 Flow 文件管理器地址栏上传")
+            QToolTip.showText(QCursor.pos(), msg, button)
+        except Exception as e:
+            from PyQt6.QtWidgets import QMessageBox
+            QMessageBox.critical(self, "错误", f"复制图片路径失败: {e}")
 

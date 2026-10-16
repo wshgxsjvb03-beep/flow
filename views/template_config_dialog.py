@@ -1,7 +1,8 @@
 # -*- coding: utf-8 -*-
 from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QPushButton, 
                              QListWidget, QListWidgetItem, QLabel, QLineEdit, 
-                             QTextEdit, QTabWidget, QWidget, QMessageBox, QSplitter)
+                             QTextEdit, QTabWidget, QWidget, QMessageBox, QSplitter,
+                             QFileDialog)
 from PyQt6.QtCore import Qt
 import uuid
 
@@ -111,16 +112,31 @@ class TemplateConfigDialog(QDialog):
         
         # 2. Setup Camera Motions Tab
         self.init_motions_tab()
+        self.init_batch_templates_tab()
         
         layout.addWidget(self.tabs)
         
-        # Bottom Close Button
-        btn_close_layout = QHBoxLayout()
-        btn_close_layout.addStretch()
+        # Bottom Action Buttons
+        btn_bottom_layout = QHBoxLayout()
+        
+        self.btn_export = QPushButton("📤 导出配置")
+        self.btn_export.clicked.connect(self.export_config)
+        self.btn_export.setStyleSheet("background-color: #8D6E63; color: white;")
+        
+        self.btn_import = QPushButton("📥 导入配置")
+        self.btn_import.clicked.connect(self.import_config)
+        self.btn_import.setStyleSheet("background-color: #8D6E63; color: white;")
+        
+        btn_bottom_layout.addWidget(self.btn_export)
+        btn_bottom_layout.addWidget(self.btn_import)
+        
+        btn_bottom_layout.addStretch()
+        
         self.btn_close = QPushButton("关闭")
         self.btn_close.clicked.connect(self.accept)
-        btn_close_layout.addWidget(self.btn_close)
-        layout.addLayout(btn_close_layout)
+        btn_bottom_layout.addWidget(self.btn_close)
+        
+        layout.addLayout(btn_bottom_layout)
 
     def init_templates_tab(self):
         tab = QWidget()
@@ -249,6 +265,10 @@ class TemplateConfigDialog(QDialog):
         self.tabs.addTab(tab, "🎥 运镜预设")
 
     def load_data(self):
+        if hasattr(self, "list_batch"):
+            self.list_batch.clear()
+            for t in self.tm.batch_templates:
+                self.list_batch.addItem(t.get("name", "未命名批量模板"))
         """Loads items from template manager into widgets."""
         # Load templates
         self.list_templates.clear()
@@ -445,3 +465,132 @@ class TemplateConfigDialog(QDialog):
             self.tm.init_default_motions()
             self.load_data()
             QMessageBox.information(self, "重置成功", "已恢复默认运镜预设！")
+
+    def export_config(self):
+        """Exports both templates and motions to a selected JSON file."""
+        file_path, _ = QFileDialog.getSaveFileName(
+            self, "导出模板与运镜配置", "flow_templates_config.json", "JSON Files (*.json)"
+        )
+        if file_path:
+            success, msg = self.tm.export_all(file_path)
+            if success:
+                QMessageBox.information(self, "导出成功", "模板与运镜配置已成功导出！")
+            else:
+                QMessageBox.critical(self, "导出失败", msg)
+
+    def import_config(self):
+        """Imports both templates and motions from a selected JSON file."""
+        file_path, _ = QFileDialog.getOpenFileName(
+            self, "导入模板与运镜配置", "", "JSON Files (*.json)"
+        )
+        if file_path:
+            reply = QMessageBox.question(
+                self, "确认导入",
+                "导入配置将会覆盖当前的模板和运镜设置，是否继续？",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No
+            )
+            if reply == QMessageBox.StandardButton.Yes:
+                success, msg = self.tm.import_all(file_path)
+                if success:
+                    self.load_data()  # Refresh UI
+                    QMessageBox.information(self, "导入成功", "模板与运镜配置已成功导入！")
+                else:
+                    QMessageBox.critical(self, "导入失败", msg)
+
+    def init_batch_templates_tab(self):
+        tab = QWidget()
+        layout = QHBoxLayout(tab)
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        
+        left_widget = QWidget()
+        left_layout = QVBoxLayout(left_widget)
+        left_layout.setContentsMargins(0, 0, 0, 0)
+        left_layout.addWidget(QLabel("已保存的批量模板:"))
+        self.list_batch = QListWidget()
+        self.list_batch.currentRowChanged.connect(self.on_batch_selected)
+        left_layout.addWidget(self.list_batch)
+        
+        btn_left_layout = QHBoxLayout()
+        self.btn_new_batch = QPushButton("＋ 新建")
+        self.btn_new_batch.clicked.connect(self.new_batch_template)
+        self.btn_delete_batch = QPushButton("🗑️ 删除")
+        self.btn_delete_batch.setObjectName("btn_delete")
+        self.btn_delete_batch.clicked.connect(self.delete_batch_template)
+        
+        btn_left_layout.addWidget(self.btn_new_batch)
+        btn_left_layout.addWidget(self.btn_delete_batch)
+        left_layout.addLayout(btn_left_layout)
+        splitter.addWidget(left_widget)
+        
+        right_widget = QWidget()
+        right_layout = QVBoxLayout(right_widget)
+        right_layout.setContentsMargins(0, 0, 0, 0)
+        right_layout.addWidget(QLabel("批量模板名称:"))
+        self.txt_batch_name = QLineEdit()
+        right_layout.addWidget(self.txt_batch_name)
+        right_layout.addWidget(QLabel("模板内容:"))
+        self.txt_batch_content = QTextEdit()
+        right_layout.addWidget(self.txt_batch_content)
+        
+        save_layout = QHBoxLayout()
+        save_layout.addStretch()
+        self.btn_save_batch = QPushButton("💾 保存批量模板")
+        self.btn_save_batch.clicked.connect(self.save_batch_template)
+        save_layout.addWidget(self.btn_save_batch)
+        right_layout.addLayout(save_layout)
+        
+        splitter.addWidget(right_widget)
+        splitter.setSizes([300, 550])
+        layout.addWidget(splitter)
+        self.tabs.addTab(tab, "🚀 批量模板")
+
+    def on_batch_selected(self, row):
+        if row < 0 or row >= len(self.tm.batch_templates):
+            self.txt_batch_name.clear()
+            self.txt_batch_content.clear()
+            return
+        tpl = self.tm.batch_templates[row]
+        self.txt_batch_name.setText(tpl.get("name", ""))
+        self.txt_batch_content.setPlainText(tpl.get("content", ""))
+
+    def new_batch_template(self):
+        import uuid
+        new_tpl = {
+            "id": "bt-" + uuid.uuid4().hex[:8],
+            "name": "新建批量模板",
+            "content": "在此输入批量生成提示词..."
+        }
+        self.tm.batch_templates.append(new_tpl)
+        self.tm.save_batch_templates()
+        self.load_data()
+        self.list_batch.setCurrentRow(len(self.tm.batch_templates) - 1)
+
+    def delete_batch_template(self):
+        row = self.list_batch.currentRow()
+        if row < 0 or row >= len(self.tm.batch_templates):
+            return
+        reply = QMessageBox.question(self, "确认删除", "是否确定删除该批量模板？", QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        if reply == QMessageBox.StandardButton.Yes:
+            self.tm.batch_templates.pop(row)
+            self.tm.save_batch_templates()
+            self.load_data()
+
+    def save_batch_template(self):
+        row = self.list_batch.currentRow()
+        if row < 0 or row >= len(self.tm.batch_templates):
+            QMessageBox.warning(self, "未选择", "请先在左侧选择要保存的批量模板。")
+            return
+        
+        name = self.txt_batch_name.text().strip()
+        if not name:
+            QMessageBox.warning(self, "名称为空", "批量模板名称不能为空。")
+            return
+            
+        self.tm.batch_templates[row]["name"] = name
+        self.tm.batch_templates[row]["content"] = self.txt_batch_content.toPlainText()
+        self.tm.save_batch_templates()
+        
+        self.load_data()
+        self.list_batch.setCurrentRow(row)
+        QMessageBox.information(self, "成功", "批量模板已保存！")

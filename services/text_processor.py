@@ -169,7 +169,95 @@ class TextProcessor:
 
         if current_segment:
             segments.append(TextProcessor.remove_punctuation(current_segment))
-            
+        
+        # Stage 3: Enforce minimum segment character count
+        # If min_segment_chars > 0, merge any segment shorter than the minimum into its neighbor.
+        # When simple 2-way merging would exceed max_limit, try combining 3+ neighboring
+        # segments and re-splitting them by word boundaries to produce balanced segments.
+        min_chars = getattr(config_manager, "min_segment_chars", 0) if config_manager else 0
+        if min_chars > 0 and len(segments) > 1:
+            merged = True
+            while merged:
+                merged = False
+                i = 0
+                while i < len(segments):
+                    seg_text = TextProcessor.remove_punctuation(segments[i])
+                    if len(seg_text) < min_chars and len(segments) > 1:
+                        # Strategy 1: Simple merge with next segment (if fits within max_limit)
+                        if i + 1 < len(segments):
+                            combined = (segments[i] + " " + segments[i + 1]).strip()
+                            combined = TextProcessor.remove_punctuation(combined)
+                            if len(combined) <= max_limit:
+                                segments[i] = combined
+                                segments.pop(i + 1)
+                                merged = True
+                                continue
+                        # Strategy 2: Simple merge with previous segment (if fits within max_limit)
+                        if i > 0:
+                            combined = (segments[i - 1] + " " + segments[i]).strip()
+                            combined = TextProcessor.remove_punctuation(combined)
+                            if len(combined) <= max_limit:
+                                segments[i - 1] = combined
+                                segments.pop(i)
+                                merged = True
+                                continue
+                        # Strategy 3: Multi-segment redistribution
+                        # When simple merge exceeds max_limit, combine multiple neighboring
+                        # segments and re-split by word boundaries to produce balanced segments
+                        # that all meet min_chars.
+                        ranges_to_try = []
+                        n = len(segments)
+                        # 2-segment combinations (re-split into balanced parts)
+                        if i > 0:
+                            ranges_to_try.append((i - 1, i + 1))
+                        if i + 1 < n:
+                            ranges_to_try.append((i, i + 2))
+                        # 3-segment combinations
+                        if i > 0 and i + 1 < n:
+                            ranges_to_try.append((i - 1, i + 2))
+                        if i > 1:
+                            ranges_to_try.append((i - 2, i + 1))
+                        if i + 2 < n:
+                            ranges_to_try.append((i, i + 3))
+                        # 4-segment combinations (fallback for extreme cases)
+                        if i > 1 and i + 1 < n:
+                            ranges_to_try.append((i - 2, i + 2))
+                        if i > 0 and i + 2 < n:
+                            ranges_to_try.append((i - 1, i + 3))
+
+                        redistributed = False
+                        for start_idx, end_idx in ranges_to_try:
+                            range_segs = segments[start_idx:end_idx]
+                            combined_text = " ".join(range_segs).strip()
+                            combined_text = TextProcessor.remove_punctuation(combined_text)
+
+                            # Re-split combined text by word boundaries using greedy algorithm
+                            words = combined_text.split()
+                            new_segs = []
+                            current = ""
+                            for word in words:
+                                test = (current + " " + word).strip() if current else word
+                                if len(test) <= max_limit:
+                                    current = test
+                                else:
+                                    if current:
+                                        new_segs.append(current)
+                                    current = word
+                            if current:
+                                new_segs.append(current)
+
+                            # Accept only if ALL new segments meet min_chars
+                            if new_segs and all(len(s) >= min_chars for s in new_segs):
+                                segments[start_idx:end_idx] = new_segs
+                                redistributed = True
+                                merged = True
+                                break
+
+                        if redistributed:
+                            continue
+                        # If no redistribution worked, leave segment as-is
+                    i += 1
+
         # Assign durations
         block_results = []
         for seg in segments:
@@ -197,3 +285,4 @@ class TextProcessor:
             })
             
         return block_results
+

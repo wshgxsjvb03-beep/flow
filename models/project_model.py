@@ -131,6 +131,107 @@ class ProjectModel:
             lines.append(current_line)
         return lines
 
+    def _get_global_max_image_index(self):
+        """Finds the maximum numeric image filename across all projects."""
+        max_idx = 0
+        base_path = self.project_dir.parent
+        if not base_path.exists():
+            return 0
+            
+        import re
+        pattern = re.compile(r'^(\d+)\.[a-zA-Z]+$')
+        
+        for proj_dir in base_path.iterdir():
+            if proj_dir.is_dir():
+                dl_dir = proj_dir / "downloads"
+                if dl_dir.exists():
+                    for f in dl_dir.iterdir():
+                        if f.is_file():
+                            match = pattern.match(f.name)
+                            if match:
+                                val = int(match.group(1))
+                                if val > max_idx:
+                                    max_idx = val
+        return max_idx
+
+    def rename_images(self, start_idx=None, return_next_idx=False):
+        """Renames downloaded images to a global sequential format: 1.ext, 2.ext, etc."""
+        downloads_dir = self.project_dir / "downloads"
+        if not downloads_dir.exists():
+            return (0, start_idx) if return_next_idx else 0
+            
+        images = []
+        for item in downloads_dir.iterdir():
+            if item.is_file() and item.suffix.lower() in [".jpg", ".jpeg", ".png", ".webp", ".gif"]:
+                images.append(item)
+                
+        if not images:
+            return (0, start_idx) if return_next_idx else 0
+            
+        images.sort(key=lambda x: (x.stat().st_mtime, x.name))
+        
+        if start_idx is None:
+            start_idx = self._get_global_max_image_index() + 1
+            
+        rename_count = 0
+        idx = start_idx
+        path_mapping = {}
+        
+        import uuid
+        
+        # Pass 1: rename to temporary names to avoid collision within the same folder
+        tmp_images = []
+        for img in images:
+            tmp_name = f"tmp_{uuid.uuid4().hex}{img.suffix}"
+            tmp_path = downloads_dir / tmp_name
+            try:
+                img.rename(tmp_path)
+                tmp_images.append((img, tmp_path))
+            except Exception as e:
+                print(f"Failed to temp rename {img.name}: {e}")
+                tmp_images.append((img, img))
+                
+        # Pass 2: rename to final numeric sequence
+        for original_img, current_path in tmp_images:
+            ext = original_img.suffix.lower()
+            if ext == '.jpeg': ext = '.jpg'
+            new_name = f"{idx}{ext}"
+            new_path = downloads_dir / new_name
+            
+            try:
+                current_path.rename(new_path)
+                old_rel = f"downloads/{original_img.name}"
+                new_rel = f"downloads/{new_name}"
+                if original_img.name != new_name:
+                    path_mapping[old_rel] = new_rel
+                    rename_count += 1
+            except Exception as e:
+                print(f"Failed to rename {original_img.name} to {new_name}: {e}")
+                
+            idx += 1
+            
+        if rename_count > 0:
+            name_mapping = {} # old_name -> new_name
+            for old_rel, new_rel in path_mapping.items():
+                old_name = old_rel.split('/')[-1]
+                new_name = new_rel.split('/')[-1]
+                name_mapping[old_name] = new_name
+                
+            for media in self.associated_media:
+                old_p = media.get("file_path")
+                if old_p in path_mapping:
+                    media["file_path"] = path_mapping[old_p]
+                    
+            for seg in self.spanish_segments:
+                if seg.get("image_name") in name_mapping:
+                    seg["image_name"] = name_mapping[seg["image_name"]]
+                if seg.get("end_image_name") in name_mapping:
+                    seg["end_image_name"] = name_mapping[seg["end_image_name"]]
+                    
+            self.save()
+            
+        return (rename_count, idx) if return_next_idx else rename_count
+
     def update_media_files(self):
         """Scans project_dir/downloads and updates associated_media, ensuring unique stems across all files."""
         downloads_dir = self.project_dir / "downloads"
@@ -152,7 +253,7 @@ class ProjectModel:
         
         # Scan downloads folder
         for item in downloads_dir.iterdir():
-            if item.is_file():
+            if item.is_file() and item.suffix.lower() in [".jpg", ".jpeg", ".png", ".webp", ".gif"]:
                 # We save relative path to project_dir
                 rel_path = f"downloads/{item.name}"
                 if rel_path not in existing_paths:

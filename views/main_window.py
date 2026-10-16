@@ -9,7 +9,6 @@ from PyQt6.QtGui import QGuiApplication, QCursor, QColor
 from models.storage_manager import StorageManager
 from views.import_dialog import ImportDialog
 from views.project_detail_widget import ProjectDetailWidget
-from services.pipeline_scheduler import PipelineScheduler
 from pathlib import Path
 
 class RenameProjectDialog(QDialog):
@@ -136,20 +135,11 @@ class MainWindow(QMainWindow):
         self.plugin_server.alarm_detected_signal.connect(self.on_plugin_alarm_detected)
         self.update_plugin_status_ui()
 
-        # Initialize Global Multi-Project Pipeline Scheduler
-        self.pipeline_scheduler = PipelineScheduler(main_window=self, parent=self)
-        self.pipeline_scheduler.pipeline_started_signal.connect(self.on_pipeline_started)
-        self.pipeline_scheduler.pipeline_stopped_signal.connect(self.on_pipeline_stopped)
-        self.pipeline_scheduler.pipeline_finished_signal.connect(self.on_pipeline_finished)
-        self.pipeline_scheduler.project_switched_signal.connect(self.on_pipeline_project_switched)
-        self.pipeline_scheduler.project_completed_signal.connect(self.on_pipeline_project_completed)
-        self.pipeline_scheduler.points_exhausted_signal.connect(self.on_pipeline_points_exhausted)
-        self.pipeline_scheduler.progress_updated_signal.connect(self.on_pipeline_progress_updated)
-        
         self.load_initial_state()
 
     def init_ui(self):
-        self.setWindowTitle("项目管理器 (Project Manager)")
+        from version import __version__
+        self.setWindowTitle(f"FlowCue v{__version__}")
         self.resize(1200, 800)
         self.setMinimumSize(1000, 600)
         
@@ -285,6 +275,15 @@ class MainWindow(QMainWindow):
         
         top_layout.addSpacing(8)
         
+        self.btn_batch_rename_images = QPushButton("🔄 命名所有图片")
+        self.btn_batch_rename_images.setObjectName("btn_batch_rename_images")
+        self.btn_batch_rename_images.setStyleSheet("background-color: #6366F1; color: white; font-weight: bold;")
+        self.btn_batch_rename_images.setToolTip("为所有项目里的图片按照规则（前7位字符+序号）自动重命名")
+        self.btn_batch_rename_images.clicked.connect(self.batch_rename_all_images)
+        top_layout.addWidget(self.btn_batch_rename_images)
+        
+        top_layout.addSpacing(8)
+        
         self.btn_refresh_points = QPushButton("🔄 刷新点数")
         self.btn_refresh_points.setObjectName("btn_refresh_points")
         self.btn_refresh_points.setStyleSheet("""
@@ -303,7 +302,18 @@ class MainWindow(QMainWindow):
         self.btn_refresh_points.setToolTip("向所有已连接的浏览器插件发送指令，模拟点击头像以获取最新真实点数")
         self.btn_refresh_points.clicked.connect(self.manual_refresh_plugin_points)
         top_layout.addWidget(self.btn_refresh_points)
-        
+
+        self.btn_check_update = QPushButton("⬆️ 检查更新")
+        self.btn_check_update.setStyleSheet("""
+            QPushButton { background-color: #2563EB; color: white; font-size: 12px;
+                          font-weight: bold; padding: 4px 10px; border-radius: 4px; }
+            QPushButton:hover { background-color: #1D4ED8; }
+        """)
+        self.btn_check_update.setToolTip("检查 GitHub 上是否有新版本，并可一键下载安装")
+        self.btn_check_update.clicked.connect(self.open_update_dialog)
+        top_layout.addWidget(self.btn_check_update)
+        QTimer.singleShot(6000, self._silent_update_check)
+
         main_layout.addLayout(top_layout)
         
         # 2. Main Area (Splitter: Sidebar and Details)
@@ -336,89 +346,6 @@ class MainWindow(QMainWindow):
         self.btn_clear_all_proj.clicked.connect(self.deselect_all_projects_for_pipeline)
         hdr_row.addWidget(self.btn_clear_all_proj)
         p_box_layout.addLayout(hdr_row)
-
-        self.btn_toggle_pipeline = QPushButton("🚀 启动全局无人值守流水线")
-        self.btn_toggle_pipeline.setObjectName("btn_toggle_pipeline")
-        self.btn_toggle_pipeline.setStyleSheet("""
-            QPushButton#btn_toggle_pipeline {
-                background-color: #059669;
-                color: white;
-                font-size: 12px;
-                font-weight: bold;
-                padding: 7px;
-                border-radius: 4px;
-            }
-            QPushButton#btn_toggle_pipeline:hover {
-                background-color: #047857;
-            }
-        """)
-        self.btn_toggle_pipeline.clicked.connect(self.toggle_global_pipeline)
-        p_box_layout.addWidget(self.btn_toggle_pipeline)
-
-        # 实时生成监控看板 (HUD)
-        self.pipeline_hud = QFrame()
-        self.pipeline_hud.setStyleSheet("""
-            QFrame {
-                background-color: #FFFFFF;
-                border: 1px solid #D7CCC8;
-                border-radius: 6px;
-                padding: 6px;
-            }
-            QProgressBar {
-                border: 1px solid #E2E8F0;
-                border-radius: 4px;
-                text-align: center;
-                font-size: 10px;
-                font-weight: bold;
-                color: #1E293B;
-                background-color: #F1F5F9;
-                height: 14px;
-            }
-            QProgressBar::chunk {
-                background-color: #10B981;
-                border-radius: 3px;
-            }
-        """)
-        hud_layout = QVBoxLayout(self.pipeline_hud)
-        hud_layout.setContentsMargins(6, 6, 6, 6)
-        hud_layout.setSpacing(4)
-
-        # 状态标题
-        self.lbl_pipeline_status = QLabel("就绪：勾选项目后点击启动")
-        self.lbl_pipeline_status.setStyleSheet("font-size: 11px; color: #4B5563; font-weight: bold; padding: 1px;")
-        hud_layout.addWidget(self.lbl_pipeline_status)
-
-        # 项目级进度条
-        self.lbl_proj_pbar_title = QLabel("📦 工程总进度: 0 / 0")
-        self.lbl_proj_pbar_title.setStyleSheet("font-size: 10px; color: #64748B; font-weight: normal;")
-        hud_layout.addWidget(self.lbl_proj_pbar_title)
-
-        self.pbar_projects = QProgressBar()
-        self.pbar_projects.setRange(0, 100)
-        self.pbar_projects.setValue(0)
-        hud_layout.addWidget(self.pbar_projects)
-
-        # 视频片段级进度条
-        self.lbl_video_pbar_title = QLabel("🎬 当前工程视频: 0 / 0")
-        self.lbl_video_pbar_title.setStyleSheet("font-size: 10px; color: #64748B; font-weight: normal;")
-        hud_layout.addWidget(self.lbl_video_pbar_title)
-
-        self.pbar_videos = QProgressBar()
-        self.pbar_videos.setRange(0, 100)
-        self.pbar_videos.setValue(0)
-        self.pbar_videos.setStyleSheet("""
-            QProgressBar::chunk {
-                background-color: #8B5CF6;
-            }
-        """)
-        hud_layout.addWidget(self.pbar_videos)
-
-        # 详细数据指标
-        self.lbl_pipeline_detail = QLabel("⚡ 在线 Worker: 0 | 剩余积分: 0")
-        self.lbl_pipeline_detail.setStyleSheet("font-size: 10px; color: #475569; padding-top: 2px;")
-        hud_layout.addWidget(self.lbl_pipeline_detail)
-
-        p_box_layout.addWidget(self.pipeline_hud)
 
         sidebar_layout.addWidget(pipeline_box)
 
@@ -456,7 +383,30 @@ class MainWindow(QMainWindow):
         
         # Set splitter proportions (approx 25% sidebar, 75% details)
         splitter.setSizes([300, 900])
-        main_layout.addWidget(splitter, stretch=1)
+
+        from PyQt6.QtWidgets import QTabWidget
+        self.main_tab_widget = QTabWidget()
+        self.main_tab_widget.setStyleSheet("""
+            QTabWidget::pane { border: 1px solid #D7CCC8; border-radius: 4px; background-color: #F5EBE6; }
+            QTabBar::tab {
+                background-color: #EDE0D4; color: #5D4037; font-size: 13px; font-weight: bold;
+                padding: 8px 20px; border: 1px solid #D7CCC8; border-bottom: none;
+                border-top-left-radius: 6px; border-top-right-radius: 6px; margin-right: 2px;
+            }
+            QTabBar::tab:selected { background-color: #F5EBE6; border-bottom: 2px solid #E0A96D; }
+            QTabBar::tab:hover { background-color: #FFE0B2; }
+        """)
+        self.main_tab_widget.addTab(splitter, "📋 项目管理")
+
+        from views.batch_generate_tab import BatchGenerateTabWidget
+        self.batch_generate_tab = BatchGenerateTabWidget(self.plugin_server, self)
+        self.main_tab_widget.addTab(self.batch_generate_tab, "🚀 批量生成")
+
+        from views.hosted_mode_widget import HostedModeWidget
+        self.hosted_mode = HostedModeWidget(self.plugin_server, self)
+        self.main_tab_widget.addTab(self.hosted_mode, "🤖 全局托管")
+        self.account_monitor = None
+        main_layout.addWidget(self.main_tab_widget, stretch=1)
 
     def load_initial_state(self):
         """Displays saved base path if it exists and loads projects list."""
@@ -712,6 +662,7 @@ class MainWindow(QMainWindow):
             from models.project_model import ProjectModel
             try:
                 proj = ProjectModel(proj_path)
+                proj.rename_images()
                 proj.update_media_files()
             except Exception as e:
                 print(f"Error updating project files: {e}")
@@ -719,6 +670,29 @@ class MainWindow(QMainWindow):
         # Notify detail widget if current project matches
         if self.detail_widget.project_model and self.detail_widget.project_model.project_id == project_id:
             self.detail_widget.on_download_finished(success, msg)
+
+    def open_update_dialog(self):
+        from views.update_dialog import UpdateDialog
+        dlg = UpdateDialog(self, auto_check=True)
+        dlg.exec()
+
+    def _silent_update_check(self):
+        """启动后静默检查一次；有新版本时仅把按钮改成醒目提示，不弹窗打扰。"""
+        try:
+            from services.updater import CheckUpdateThread
+            self._silent_check_thread = CheckUpdateThread()
+
+            def _done(res):
+                if res.get("has_update"):
+                    self.btn_check_update.setText(f"🆕 有新版本 v{res['version']}")
+                    self.btn_check_update.setStyleSheet(
+                        "QPushButton { background-color: #DC2626; color: white; font-size: 12px;"
+                        " font-weight: bold; padding: 4px 10px; border-radius: 4px; }"
+                        "QPushButton:hover { background-color: #B91C1C; }")
+            self._silent_check_thread.finished_signal.connect(_done)
+            self._silent_check_thread.start()
+        except Exception:
+            pass
 
     def delete_selected_project(self):
         """Permanently deletes the selected project folder and files."""
@@ -749,16 +723,14 @@ class MainWindow(QMainWindow):
             # 2. Delete the directory recursively
             import shutil
             try:
-                base_storage = self.storage_manager.get_base_path()
-                if base_storage:
-                    resolved_base = base_storage.resolve()
-                    resolved_proj = project_path.resolve()
-                    if not resolved_proj.is_relative_to(resolved_base) or resolved_proj == resolved_base:
-                        QMessageBox.critical(self, "错误", "安全拦截：项目路径不在存储总路径范围内，拒绝删除！")
-                        return
+                base = self.storage_manager.base_path.resolve() if self.storage_manager.base_path else None
+                resolved_target = project_path.resolve()
+                if not base or not resolved_target.is_relative_to(base) or resolved_target == base:
+                    QMessageBox.critical(self, "错误", "安全拦截：目标路径不在有效工程根目录内，已中止删除！")
+                    return
 
-                if project_path.exists() and project_path.is_dir():
-                    shutil.rmtree(project_path)
+                if resolved_target.exists() and resolved_target.is_dir():
+                    shutil.rmtree(resolved_target)
                 
                 # Delete corresponding subtitle file in "字幕" folder
                 subtitles_dir = project_path.parent / "字幕"
@@ -862,132 +834,6 @@ class MainWindow(QMainWindow):
             item = self.list_projects.item(i)
             item.setCheckState(Qt.CheckState.Unchecked)
 
-    def toggle_global_pipeline(self):
-        """Starts or stops the multi-project automated pipeline."""
-        if self.pipeline_scheduler.is_running:
-            self.pipeline_scheduler.stop()
-            return
-
-        # Gather checked projects from sidebar list
-        checked_projects = []
-        for i in range(self.list_projects.count()):
-            item = self.list_projects.item(i)
-            if item.checkState() == Qt.CheckState.Checked:
-                p_data = item.data(Qt.ItemDataRole.UserRole + 1)
-                if p_data:
-                    checked_projects.append(p_data)
-
-        if not checked_projects:
-            QMessageBox.warning(self, "提示", "请先在项目列表中勾选至少一个要生成的项目！")
-            return
-
-        clients = self.plugin_server.get_online_clients() if self.plugin_server else []
-        if not clients:
-            QMessageBox.warning(self, "提示", "当前没有在线的浏览器 Worker。请先打开 Google Flow 网页。")
-            return
-
-        self.pipeline_scheduler.set_queue(checked_projects)
-        self.pipeline_scheduler.start()
-
-    def on_pipeline_started(self, total_count):
-        """UI updates when global pipeline starts."""
-        self.btn_toggle_pipeline.setText("⏸️ 暂停全局流水线")
-        self.btn_toggle_pipeline.setStyleSheet("""
-            QPushButton#btn_toggle_pipeline {
-                background-color: #DC2626;
-                color: white;
-                font-size: 12px;
-                font-weight: bold;
-                padding: 7px;
-                border-radius: 4px;
-            }
-            QPushButton#btn_toggle_pipeline:hover {
-                background-color: #B91C1C;
-            }
-        """)
-        self.lbl_pipeline_status.setText(f"🚀 流水线启动，共排队 {total_count} 个工程")
-        self.lbl_pipeline_status.setStyleSheet("font-size: 11px; color: #059669; font-weight: bold; padding: 1px;")
-        self.pbar_projects.setMaximum(max(1, total_count))
-        self.pbar_projects.setValue(0)
-        self.lbl_proj_pbar_title.setText(f"📦 全局工程: 0 / {total_count}")
-
-    def on_pipeline_stopped(self):
-        """UI updates when global pipeline stops."""
-        self.btn_toggle_pipeline.setText("🚀 启动全局无人值守流水线")
-        self.btn_toggle_pipeline.setStyleSheet("""
-            QPushButton#btn_toggle_pipeline {
-                background-color: #059669;
-                color: white;
-                font-size: 12px;
-                font-weight: bold;
-                padding: 7px;
-                border-radius: 4px;
-            }
-            QPushButton#btn_toggle_pipeline:hover {
-                background-color: #047857;
-            }
-        """)
-        self.lbl_pipeline_status.setText("⏸️ 流水线已暂停")
-        self.lbl_pipeline_status.setStyleSheet("font-size: 11px; color: #DC2626; font-weight: bold; padding: 1px;")
-        self.setWindowTitle("项目管理器 (Project Manager)")
-
-    def on_pipeline_project_switched(self, proj_name, current_idx, total_count):
-        """UI updates when pipeline advances to next project."""
-        self.lbl_pipeline_status.setText(f"⚡ 正在生成 [{current_idx}/{total_count}]: {proj_name}")
-        self.lbl_pipeline_status.setStyleSheet("font-size: 11px; color: #2563EB; font-weight: bold; padding: 1px;")
-        self.lbl_proj_pbar_title.setText(f"📦 全局工程: 第 {current_idx}/{total_count} 个")
-        self.pbar_projects.setValue(current_idx - 1)
-
-    def on_pipeline_progress_updated(self, proj_name, cur_proj_idx, total_projs, completed_vids, total_vids, pool_pts):
-        """Real-time UI update callback when video progress changes."""
-        # 1. Update project-level progress bar
-        proj_pct = int(cur_proj_idx / max(1, total_projs) * 100)
-        self.lbl_proj_pbar_title.setText(f"📦 全局工程: 第 {cur_proj_idx}/{total_projs} 个 ({proj_pct}%)")
-        self.pbar_projects.setMaximum(max(1, total_projs))
-        self.pbar_projects.setValue(cur_proj_idx)
-
-        # 2. Update video-level progress bar
-        vid_pct = int(completed_vids / max(1, total_vids) * 100) if total_vids > 0 else 0
-        self.lbl_video_pbar_title.setText(f"🎬 当前工程视频: 第 {completed_vids}/{total_vids} 个 ({vid_pct}%)")
-        self.pbar_videos.setMaximum(max(1, total_vids))
-        self.pbar_videos.setValue(completed_vids)
-
-        # 3. Update main status label
-        self.lbl_pipeline_status.setText(f"⚡ 正在生成 [{cur_proj_idx}/{total_projs}]: {proj_name}")
-        self.lbl_pipeline_status.setStyleSheet("font-size: 11px; color: #2563EB; font-weight: bold; padding: 1px;")
-
-        # 4. Update online workers & points info
-        workers_count = len(self.plugin_server.get_online_clients()) if self.plugin_server else 0
-        self.lbl_pipeline_detail.setText(f"🌐 Worker: {workers_count} 在线 | ⚡ 剩余积分: {pool_pts} pts")
-
-        # 5. Update window title
-        self.setWindowTitle(f"项目管理器 - [全局生成 {cur_proj_idx}/{total_projs} 工程 | 视频 {completed_vids}/{total_vids}]")
-
-    def on_pipeline_project_completed(self, proj_name, project_idx):
-        """UI updates when a project in queue is 100% finished."""
-        self.reload_projects_list()
-
-    def on_pipeline_finished(self, completed_count, total_count):
-        """UI notification when entire queue completes."""
-        self.on_pipeline_stopped()
-        self.reload_projects_list()
-        self.pbar_projects.setValue(total_count)
-        self.pbar_videos.setValue(self.pbar_videos.maximum())
-        self.lbl_proj_pbar_title.setText(f"📦 全局工程: {completed_count}/{total_count} 全部完成 (100%)")
-        self.lbl_video_pbar_title.setText("🎬 所有视频已全部就绪 (100%)")
-        self.lbl_pipeline_status.setText(f"🎉 全部完成！共成功跑完 {completed_count}/{total_count} 个工程")
-        self.lbl_pipeline_status.setStyleSheet("font-size: 11px; color: #059669; font-weight: bold; padding: 1px;")
-        QMessageBox.information(self, "流水线全部完成", f"🎉 恭喜！排队的 {completed_count} 个工程已全部 100% 生成并自动标绿归档！")
-
-    def on_pipeline_points_exhausted(self, total_pts):
-        """UI notification when all workers run out of credits."""
-        self.on_pipeline_stopped()
-        QMessageBox.warning(
-            self, "浏览器点数已榨干",
-            f"⚠️ 所有在线浏览器的可用点数已全部消耗完毕 (总点数剩余 {total_pts} 点，不足以支付下一个片段)。\n\n"
-            "全局流水线已安全挂起并自动保存所有已完成的工程。"
-        )
-
     def select_project_by_info(self, proj_info):
         """Selects and opens project in UI given its info dict."""
         target_path = proj_info.get("path") if isinstance(proj_info, dict) else str(proj_info)
@@ -997,6 +843,44 @@ class MainWindow(QMainWindow):
                 self.list_projects.setCurrentItem(item)
                 self.detail_widget.set_project(target_path)
                 break
+
+    def batch_rename_all_images(self):
+        """Iterates through all projects and auto-renames their images based on the global sequential rule."""
+        projects = self.storage_manager.list_projects()
+        if not projects:
+            QMessageBox.information(self, "提示", "当前没有项目。")
+            return
+            
+        # Sort projects by their natural index so numbering flows correctly
+        try:
+            projects.sort(key=lambda p: int(p.get("index_str", "0")))
+        except Exception:
+            projects.sort(key=lambda p: p.get("id", ""))
+            
+        reply = QMessageBox.question(
+            self, "确认批量重命名",
+            "是否要为所有项目自动重命名里面的图片？\n\n(规则：将所有项目视为一个整体，依次命名为 1.jpg, 2.jpg...)",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No
+        )
+        if reply == QMessageBox.StandardButton.Yes:
+            from models.project_model import ProjectModel
+            total_renamed = 0
+            current_idx = 1
+            for p in projects:
+                proj_path = self.storage_manager.resolve_path(p["id"])
+                try:
+                    proj = ProjectModel(proj_path)
+                    renamed, current_idx = proj.rename_images(start_idx=current_idx, return_next_idx=True)
+                    total_renamed += renamed
+                except Exception as e:
+                    print(f"Failed to rename project {p['id']}: {e}")
+                    
+            # Refresh current project detail if needed
+            current_item = self.list_projects.currentItem()
+            if current_item:
+                self.on_project_clicked(current_item)
+            QMessageBox.information(self, "完成", f"批量重命名完成，共重命名了 {total_renamed} 张图片！")
 
     def closeEvent(self, event):
         """Clean up background tasks, plugin server, and media players before quitting."""

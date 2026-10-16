@@ -28,3 +28,9 @@ projects/
 *.pem
 *.cert
 credentials*.json
+
+# Local state for hosted and batch generation
+account_monitor.json
+account_aliases.json
+hosted_mode.json
+batch_templates.json

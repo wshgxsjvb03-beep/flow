@@ -17,6 +17,59 @@ def get_workspace_dir():
         return exe_dir
     return os.path.dirname(os.path.abspath(__file__))
 
+# 用户设置文件（模板配置 / 规则设置 / 账号备注等）
+USER_SETTINGS_FILES = [
+    ".app_config.json",        # 规则设置、存储路径、API Key 等
+    "prompt_templates.json",   # 模板配置
+    "camera_motions.json",     # 运镜模板
+    "account_aliases.json",    # 账号备注
+    "account_monitor.json",    # 积分阈值
+    "batch_templates.json",
+    "hosted_mode.json",
+    ".env",
+]
+
+def get_data_dir():
+    """
+    用户设置的固定保存目录：%APPDATA%\\Flow口播工具
+    与程序安装目录分离，重新安装 / 覆盖 / 卸载程序都不会丢失设置。
+    首次使用时自动把程序目录中已有的设置迁移过来（已存在的文件不会被覆盖）。
+    """
+    base = os.environ.get("APPDATA") or os.path.expanduser("~")
+    data_dir = os.path.join(base, "Flow口播工具")
+    try:
+        os.makedirs(data_dir, exist_ok=True)
+        import shutil
+        old_dir = get_workspace_dir()
+        for name in USER_SETTINGS_FILES:
+            dst = os.path.join(data_dir, name)
+            if os.path.exists(dst):
+                continue  # 用户已有设置，永不覆盖（升级安装不会丢失预设/规则）
+            for src in (os.path.join(old_dir, name), os.path.join(old_dir, "_internal", name)):
+                if os.path.isfile(src):
+                    shutil.copy2(src, dst)
+                    if name == ".app_config.json":
+                        import json
+                        with open(dst, encoding="utf-8") as config_file:
+                            config = json.load(config_file)
+                        storage_path = config.get("base_path")
+                        if storage_path and not os.path.isabs(storage_path):
+                            config["base_path"] = os.path.abspath(os.path.join(old_dir, storage_path))
+                            with open(dst, "w", encoding="utf-8") as config_file:
+                                json.dump(config, config_file, indent=4, ensure_ascii=False)
+                    break
+            if not os.path.exists(dst) and name in ("prompt_templates.json", "camera_motions.json"):
+                example = name.replace(".json", ".example.json")
+                for source_dir in (old_dir, os.path.join(old_dir, "_internal")):
+                    source = os.path.join(source_dir, example)
+                    if os.path.isfile(source):
+                        shutil.copy2(source, dst)
+                        break
+        return data_dir
+    except Exception as e:
+        log_error(f"无法使用用户设置目录 {data_dir}，回退到程序目录: {e}")
+        return get_workspace_dir()
+
 def log_error(err_str):
     try:
         ws = get_workspace_dir()
@@ -55,15 +108,41 @@ def qt_message_handler(mode, context, message):
 
 def main():
     try:
+        # Set Windows taskbar icon (AppUserModelID) so the taskbar shows our custom icon
+        # instead of the default Python icon
+        try:
+            import ctypes
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("flow.oral.video.tool")
+        except Exception:
+            pass
+
         from PyQt6.QtWidgets import QApplication
         from PyQt6.QtCore import qInstallMessageHandler
+        from PyQt6.QtGui import QIcon
         from views.main_window import MainWindow
 
         qInstallMessageHandler(qt_message_handler)
         app = QApplication(sys.argv)
         
+        # Set application icon from logo.ico
         workspace_dir = get_workspace_dir()
-        window = MainWindow(workspace_dir)
+        icon_path = None
+        # 打包后 logo.ico 在 _internal 目录中 (PyInstaller datas)
+        candidates = [
+            os.path.join(workspace_dir, "logo.ico"),
+            os.path.join(workspace_dir, "_internal", "logo.ico"),
+        ]
+        if getattr(sys, '_MEIPASS', None):
+            candidates.insert(0, os.path.join(sys._MEIPASS, "logo.ico"))
+        for p in candidates:
+            if os.path.exists(p):
+                icon_path = p
+                break
+        if icon_path:
+            app_icon = QIcon(icon_path)
+            app.setWindowIcon(app_icon)
+        
+        window = MainWindow(get_data_dir())
         window.show()
         
         sys.exit(app.exec())
@@ -72,3 +151,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

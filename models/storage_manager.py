@@ -132,7 +132,9 @@ class StorageManager:
         c7 = c7[:50]
         
         dir_name = f"{index:02d}_{c1}_{c7}-flow"
-        proj_dir = self.base_path / dir_name
+        proj_dir = (self.base_path / dir_name).resolve()
+        if not proj_dir.is_relative_to(self.base_path.resolve()):
+            raise ValueError("非法项目路径：检测到路径穿越")
         proj_dir.mkdir(parents=True, exist_ok=True)
         
         # Create a subfolder for downloads

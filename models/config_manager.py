@@ -11,6 +11,7 @@ class ConfigManager:
     CONFIG_FILE_NAME = ".app_config.json"
     
     DEFAULT_MAX_BATCH_POINTS = 50
+    DEFAULT_MIN_SEGMENT_CHARS = 0  # 0 means disabled (no minimum)
     DEFAULT_CHAR_DURATION_RULES = [
         {"max_chars": 40, "duration": 4},
         {"max_chars": 90, "duration": 6},
@@ -41,12 +42,37 @@ class ConfigManager:
         ("ar", "阿拉伯语 (Arabic)"),
     ]
     
+    # Video generation default rules
+    DEFAULT_TASK_INTERVAL = 5
+    DEFAULT_GENERATION_MODE = "VIDEO_FRAMES"
+    DEFAULT_ASPECT_RATIO = "9:16"
+    DEFAULT_VIDEO_MODEL = "omni_1_1_flash"
+    
+    SUPPORTED_GENERATION_MODES = [
+        ("VIDEO_FRAMES", "帧模式 (First Frame / 影格)"),
+        ("VIDEO_REFERENCES", "素材模式 (Ingredients / 素材)"),
+    ]
+    
+    SUPPORTED_ASPECT_RATIOS = [
+        ("9:16", "9:16 (竖屏)"),
+        ("16:9", "16:9 (横屏)"),
+    ]
+    
+    SUPPORTED_VIDEO_MODELS = [
+        ("omni_1_1_flash", "Omni 1.1 Flash (默认)"),
+        ("veo_3_1_lite", "Veo 3.1 - Lite"),
+        ("veo_3_1_fast", "Veo 3.1 - Fast"),
+        ("veo_3_1_quality", "Veo 3.1 - Quality"),
+        ("veo_3_1_lite_low_priority", "Veo 3.1 - Lite [Lower Priority]"),
+    ]
+    
     def __init__(self, workspace_dir):
         self.workspace_dir = Path(workspace_dir)
         self.config_path = self.workspace_dir / self.CONFIG_FILE_NAME
         
         self.base_path = ""
         self.max_batch_points = self.DEFAULT_MAX_BATCH_POINTS
+        self.min_segment_chars = self.DEFAULT_MIN_SEGMENT_CHARS
         self.forced_split_marker = self.DEFAULT_FORCED_SPLIT_MARKER
         self.char_duration_rules = [dict(r) for r in self.DEFAULT_CHAR_DURATION_RULES]
         self.duration_points_rules = [dict(r) for r in self.DEFAULT_DURATION_POINTS_RULES]
@@ -66,6 +92,12 @@ class ConfigManager:
         # End frame settings
         self.DEFAULT_ENABLE_END_FRAME = False
         self.enable_end_frame = self.DEFAULT_ENABLE_END_FRAME
+        
+        # Video generation default rules
+        self.task_interval = self.DEFAULT_TASK_INTERVAL
+        self.default_generation_mode = self.DEFAULT_GENERATION_MODE
+        self.default_aspect_ratio = self.DEFAULT_ASPECT_RATIO
+        self.default_video_model = self.DEFAULT_VIDEO_MODEL
         
         self.load()
 
@@ -96,6 +128,7 @@ class ConfigManager:
                     data = json.load(f)
                     self.base_path = data.get("base_path", self.base_path)
                     self.max_batch_points = data.get("max_batch_points", self.DEFAULT_MAX_BATCH_POINTS)
+                    self.min_segment_chars = data.get("min_segment_chars", self.DEFAULT_MIN_SEGMENT_CHARS)
                     self.forced_split_marker = data.get("forced_split_marker", self.DEFAULT_FORCED_SPLIT_MARKER)
                     
                     char_rules = data.get("char_duration_rules")
@@ -121,17 +154,40 @@ class ConfigManager:
                     
                     # Load end frame setting
                     self.enable_end_frame = data.get("enable_end_frame", getattr(self, "DEFAULT_ENABLE_END_FRAME", False))
+                    
+                    # Load video generation default rules
+                    try:
+                        raw_interval = data.get("task_interval", self.DEFAULT_TASK_INTERVAL)
+                        self.task_interval = max(0, int(raw_interval))
+                    except (ValueError, TypeError):
+                        self.task_interval = self.DEFAULT_TASK_INTERVAL
+                        
+                    mode_val = data.get("default_generation_mode", self.DEFAULT_GENERATION_MODE)
+                    valid_modes = {m[0] for m in self.SUPPORTED_GENERATION_MODES}
+                    self.default_generation_mode = mode_val if mode_val in valid_modes else self.DEFAULT_GENERATION_MODE
+                    
+                    aspect_val = data.get("default_aspect_ratio", self.DEFAULT_ASPECT_RATIO)
+                    valid_aspects = {a[0] for a in self.SUPPORTED_ASPECT_RATIOS}
+                    self.default_aspect_ratio = aspect_val if aspect_val in valid_aspects else self.DEFAULT_ASPECT_RATIO
+                    
+                    model_val = data.get("default_video_model", self.DEFAULT_VIDEO_MODEL)
+                    valid_models = {m[0] for m in self.SUPPORTED_VIDEO_MODELS}
+                    self.default_video_model = model_val if model_val in valid_models else self.DEFAULT_VIDEO_MODEL
             except Exception as e:
                 print(f"Error loading config: {e}")
 
-        # Environment variables take precedence if set
-        env_gladia = os.environ.get("GLADIA_API_KEYS")
-        if env_gladia:
-            self.gladia_api_keys = [k.strip() for k in re.split(r'[\n,]+', env_gladia) if k.strip()]
-
-        env_eleven = os.environ.get("ELEVENLABS_API_KEYS")
-        if env_eleven:
-            self.elevenlabs_api_keys = [k.strip() for k in re.split(r'[\n,]+', env_eleven) if k.strip()]
+        # Apply overrides even on a first run without a JSON config.
+        self._gladia_from_env = False
+        self._eleven_from_env = False
+        for plural, singular, attr, flag in (
+            ("GLADIA_API_KEYS", "GLADIA_API_KEY", "gladia_api_keys", "_gladia_from_env"),
+            ("ELEVENLABS_API_KEYS", "ELEVENLABS_API_KEY", "elevenlabs_api_keys", "_eleven_from_env"),
+        ):
+            value = os.environ.get(plural) or os.environ.get(singular)
+            keys = [key.strip() for key in re.split(r'[\n,]+', value or "") if key.strip()]
+            if keys:
+                setattr(self, attr, keys)
+                setattr(self, flag, True)
 
     def save(self):
         """Saves current configuration to .app_config.json without losing existing keys."""
@@ -143,18 +199,27 @@ class ConfigManager:
             except Exception:
                 data = {}
 
+        # Do not persist keys back into .app_config.json if they are managed via .env
+        gladia_to_save = [] if getattr(self, "_gladia_from_env", False) else self.gladia_api_keys
+        eleven_to_save = [] if getattr(self, "_eleven_from_env", False) else self.elevenlabs_api_keys
+
         data.update({
             "base_path": self.base_path or data.get("base_path", ""),
             "max_batch_points": self.max_batch_points,
+            "min_segment_chars": self.min_segment_chars,
             "forced_split_marker": self.forced_split_marker,
             "char_duration_rules": self.char_duration_rules,
             "duration_points_rules": self.duration_points_rules,
-            "gladia_api_keys": self.gladia_api_keys,
-            "elevenlabs_api_keys": self.elevenlabs_api_keys,
+            "gladia_api_keys": gladia_to_save,
+            "elevenlabs_api_keys": eleven_to_save,
             "speech_language": self.speech_language,
             "enable_plugin_server": self.enable_plugin_server,
             "plugin_server_port": self.plugin_server_port,
-            "enable_end_frame": self.enable_end_frame
+            "enable_end_frame": self.enable_end_frame,
+            "task_interval": self.task_interval,
+            "default_generation_mode": self.default_generation_mode,
+            "default_aspect_ratio": self.default_aspect_ratio,
+            "default_video_model": self.default_video_model
         })
         try:
             with open(self.config_path, "w", encoding="utf-8") as f:
@@ -166,9 +231,14 @@ class ConfigManager:
 
     def reset_to_defaults(self):
         self.max_batch_points = self.DEFAULT_MAX_BATCH_POINTS
+        self.min_segment_chars = self.DEFAULT_MIN_SEGMENT_CHARS
         self.char_duration_rules = [dict(r) for r in self.DEFAULT_CHAR_DURATION_RULES]
         self.duration_points_rules = [dict(r) for r in self.DEFAULT_DURATION_POINTS_RULES]
         self.enable_end_frame = getattr(self, "DEFAULT_ENABLE_END_FRAME", False)
+        self.task_interval = self.DEFAULT_TASK_INTERVAL
+        self.default_generation_mode = self.DEFAULT_GENERATION_MODE
+        self.default_aspect_ratio = self.DEFAULT_ASPECT_RATIO
+        self.default_video_model = self.DEFAULT_VIDEO_MODEL
         self.save()
 
     def get_duration_for_length(self, length):

@@ -18,6 +18,7 @@ class PluginServer(QObject):
     report_received_signal = pyqtSignal(dict)         # Emitted when worker completes batch and sends report
     rpc_response_signal = pyqtSignal(dict)            # Emitted when worker responds to JSON-RPC action
     alarm_detected_signal = pyqtSignal(dict)          # Emitted when worker encounters Google security/risk limits
+    hosted_event_signal = pyqtSignal(dict)            # 全局托管模式：插件推送的任务状态/批次完成事件
 
     def __init__(self, port=18188, parent=None):
         super().__init__(parent)
@@ -73,6 +74,23 @@ class PluginServer(QObject):
         self.servers.clear()
         logger.info("All WebSocket servers stopped.")
 
+    def _is_allowed_origin(self, origin):
+        """Verifies if the incoming WebSocket connection Origin is authorized to prevent CSWSH."""
+        if not origin:
+            return True  # Native desktop / test clients do not supply an Origin header
+        import urllib.parse
+        try:
+            parsed = urllib.parse.urlparse(origin)
+            host = (parsed.hostname or "").lower()
+            if origin.startswith("chrome-extension://") or origin.startswith("file://"):
+                return True
+            allowed_hosts = {"labs.google", "flow.google.com", "docs.google.com", "localhost", "127.0.0.1"}
+            if host in allowed_hosts or host.endswith(".labs.google") or host.endswith(".flow.google.com") or host == "docs.google.com":
+                return True
+        except Exception as e:
+            logger.warning(f"Error parsing origin {origin}: {e}")
+        return False
+
     def on_new_connection_from_server(self, server):
         """Handles new WebSocket client connection from any listening server."""
         if not server:
@@ -80,50 +98,13 @@ class PluginServer(QObject):
         socket = server.nextPendingConnection()
         if not socket:
             return
-            
-        # Security: Validate Origin header against Cross-Site WebSocket Hijacking (CSWSH)
-        client_origin = socket.origin()
-        if client_origin:
-            origin_lower = client_origin.lower().strip()
-            # Explicitly reject 'null' origin to prevent CSWSH attacks from sandboxed iframes or data URLs
-            if origin_lower == "null":
-                logger.warning("🚨 [Security] Rejected untrusted WebSocket connection from null Origin")
-                socket.close()
-                return
 
-            import urllib.parse
-            try:
-                parsed_origin = urllib.parse.urlparse(origin_lower)
-                scheme = parsed_origin.scheme
-                hostname = (parsed_origin.hostname or "").lower()
-            except Exception:
-                logger.warning(f"🚨 [Security] Rejected malformed Origin: {client_origin}")
-                socket.close()
-                return
-
-            is_allowed = False
-            # 1. Browser extension schemes
-            if scheme in ("chrome-extension", "moz-extension", "safari-web-extension"):
-                is_allowed = True
-            # 2. Localhost web origins
-            elif scheme in ("http", "https") and hostname in ("127.0.0.1", "localhost"):
-                is_allowed = True
-            # 3. Legitimate Google web origins for Labs / AI Test Kitchen
-            elif scheme == "https":
-                google_hosts = (
-                    "labs.google",
-                    "aitestkitchen.withgoogle.com",
-                    "google.com",
-                    "googleusercontent.com"
-                )
-                if hostname in google_hosts or any(hostname.endswith(f".{d}") for d in google_hosts):
-                    is_allowed = True
-
-            if not is_allowed:
-                logger.warning(f"🚨 [Security] Rejected untrusted WebSocket connection from Origin: {client_origin}")
-                socket.close()
-                return
-
+        origin = socket.origin()
+        if not self._is_allowed_origin(origin):
+            logger.warning(f"🚨 Blocked unauthorized WebSocket connection from untrusted origin: {origin}")
+            socket.abort()
+            return
+        
         temp_id = f"Worker_{self.client_id_counter}"
         self.client_id_counter += 1
 
@@ -132,12 +113,27 @@ class PluginServer(QObject):
             "email": "",
             "name": f"浏览器 ({temp_id})",
             "remaining_points": 0,
+            "points_known": False,
+            "points_updated_at": None,
             "status": "low_points",
             "socket": socket,
-            "current_batch": None
+            "current_batch": None,
+            "profile": "" # will be filled later
         }
 
         self.clients[socket] = client_info
+
+        # Fetch profile async to not block
+        import threading
+        def fetch_profile():
+            try:
+                from services.browser_closer import get_browser_profile_by_port
+                prof = get_browser_profile_by_port(socket.peerPort())
+                client_info["profile"] = prof
+                self.client_updated_signal.emit(client_info)
+            except Exception as e:
+                logger.error(f"Failed to fetch profile: {e}")
+        threading.Thread(target=fetch_profile, daemon=True).start()
 
         socket.textMessageReceived.connect(lambda msg, s=socket: self.on_message_received(s, msg))
         socket.disconnected.connect(lambda s=socket: self.on_client_disconnected(s))
@@ -202,13 +198,41 @@ class PluginServer(QObject):
             elif raw_email:
                 info["name"] = raw_email
 
-            credits = msg.get("credits") or msg.get("remaining_points") or data_obj.get("remaining_points")
+            credits = None
+            for c in (msg.get("credits"), msg.get("remaining_points"), data_obj.get("remaining_points")):
+                if c is not None:
+                    credits = c
+                    break
             if credits is not None:
-                info["remaining_points"] = int(credits)
-                info["status"] = "idle" if int(credits) >= 7 else "low_points"
+                try:
+                    credits = int(credits)
+                    info["remaining_points"] = credits
+                    info["points_known"] = True
+                    import time as _t
+                    info["points_updated_at"] = _t.time()
+                    info["status"] = "idle" if credits >= 7 else "low_points"
+                except (TypeError, ValueError):
+                    pass
 
             logger.info(f"✅ Client identified: {info['client_id']} ({info['name']}), Points: {info['remaining_points']}")
             self.client_updated_signal.emit(info)
+            return
+
+        # 1.4 插件后台版本检测
+        if msg_type == "bg_status":
+            info["bg_ok"] = bool(msg.get("ok")) and bool(msg.get("native_drag", True))
+            info["bg_version"] = msg.get("version", "")
+            info["bg_error"] = msg.get("error", "") or ("" if msg.get("native_drag", True) else "浏览器不支持 debugger 接口")
+            self.client_updated_signal.emit(info)
+            return
+
+        # 1.5 全局托管模式事件
+        if msg_type in ("hosted_task_status", "hosted_batch_finished"):
+            if msg_type == "hosted_batch_finished":
+                info["status"] = "idle"
+                info["current_batch"] = None
+                self.client_updated_signal.emit(info)
+            self.hosted_event_signal.emit({"client_id": info["client_id"], "type": msg_type, "message": msg})
             return
 
         # 2. 状态/点数实时更新
@@ -339,17 +363,21 @@ class PluginServer(QObject):
             task_copy = dict(task)
             img_path = task_copy.get("local_image_path")
             
-            if img_path and Path(img_path).exists():
+            if img_path:
                 try:
                     p = Path(img_path)
-                    ext = p.suffix.lower().replace(".", "")
-                    if ext == "jpg":
-                        ext = "jpeg"
-                    mime = f"image/{ext}" if ext in ["png", "jpeg", "webp", "gif"] else "image/png"
-                    
-                    with open(p, "rb") as f:
-                        b64_str = base64.b64encode(f.read()).decode("utf-8")
-                        task_copy["image_data_url"] = f"data:{mime};base64,{b64_str}"
+                    if p.is_file() and p.suffix.lower() in [".jpg", ".jpeg", ".png", ".webp", ".gif"]:
+                        # Limit to 50MB to prevent memory exhaustion
+                        if p.stat().st_size <= 50 * 1024 * 1024:
+                            ext = p.suffix.lower().replace(".", "")
+                            if ext == "jpg":
+                                ext = "jpeg"
+                            mime = f"image/{ext}"
+                            with open(p, "rb") as f:
+                                b64_str = base64.b64encode(f.read()).decode("utf-8")
+                                task_copy["image_data_url"] = f"data:{mime};base64,{b64_str}"
+                        else:
+                            logger.warning(f"Image {img_path} exceeds 50MB limit, skipping base64 encoding")
                 except Exception as err:
                     logger.warning(f"Failed to read image {img_path} for base64 encoding: {err}")
 
@@ -388,3 +416,17 @@ class PluginServer(QObject):
                 sent_count += 1
         logger.info(f"Broadcasted get_points request to {sent_count} online clients.")
         return sent_count
+
+    def close_client_browser(self, client_id, token=""):
+        """Asks the plugin to mark its window title with `token` so the app can locate and close that browser."""
+        return self.send_rpc_action(client_id, "close_browser", {"token": token})
+
+    def get_client_port(self, client_id):
+        """Returns the local TCP port of the connected client, if found."""
+        for socket, info in self.clients.items():
+            if info["client_id"] == client_id:
+                try:
+                    return socket.peerPort()
+                except Exception:
+                    pass
+        return None
