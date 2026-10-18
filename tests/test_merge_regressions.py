@@ -203,7 +203,8 @@ class IntegrationRegressionTests(unittest.TestCase):
                 self.assertEqual(task['aspect_ratio'], '16:9')
                 self.assertTrue(Path(task['local_image_path']).is_file())
                 self.assertEqual(task['end_image_name'], 'end.png')
-                self.assertEqual(Path(task['end_local_image_path']), downloads / 'end.png')
+                # Temporary directories can use symlink or Windows short-path aliases.
+                self.assertEqual(Path(task['end_local_image_path']), (downloads / 'end.png').resolve())
                 self.assertIn('Hola amigos', task['prompt'])
             finally:
                 window.close()
