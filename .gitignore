@@ -1,3 +1,31 @@
+# Only publish the project files below; other root files stay local.
+/*
+!/.gitignore
+!/.github/
+!/.app_config.example.json
+!/.env.example
+!/README.md
+!/LICENSE
+!/LICENSE.LIST
+!/requirements.txt
+!/main.py
+!/version.py
+!/create_shortcut.py
+!/flow.spec
+!/flow_tool.spec
+!/main.spec
+!/installer.iss
+!/plugin_script_adapter.js
+!/FLOW_PLUGIN_OPEN_API.md
+!/camera_motions.example.json
+!/prompt_templates.example.json
+!/extension/
+!/models/
+!/services/
+!/views/
+!/scripts/
+!/tests/
+
 .venv/
 __pycache__/
 *.pyc
@@ -37,3 +65,13 @@ batch_templates.json
 
 # Locally saved authenticated browser pages (third-party scripts/account data)
 /新建文件夹/
+
+# Editor state, caches, and temporary files can also occur in source folders.
+.idea/
+.vscode/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.tmp
+*.bak
+*.local
