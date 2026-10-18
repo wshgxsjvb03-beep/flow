@@ -20,6 +20,7 @@ import time
 import threading
 import ctypes
 import ctypes.wintypes
+import sys
 
 logger = logging.getLogger(__name__)
 
@@ -29,8 +30,9 @@ DURATION_COST = {4: 7, 5: 7, 6: 10, 8: 12, 10: 15}
 # ──────────────────────────────────────────
 # Win32 桌面自动化：操控原生文件选择器对话框
 # ──────────────────────────────────────────
-_user32 = ctypes.windll.user32
-_WNDENUMPROC = ctypes.WINFUNCTYPE(ctypes.wintypes.BOOL, ctypes.wintypes.HWND, ctypes.wintypes.LPARAM)
+_user32 = ctypes.windll.user32 if sys.platform == 'win32' else None
+_WNDENUMPROC = (ctypes.WINFUNCTYPE(ctypes.wintypes.BOOL, ctypes.wintypes.HWND, ctypes.wintypes.LPARAM)
+                if sys.platform == 'win32' else None)
 WM_SETTEXT = 0x000C
 BM_CLICK = 0x00F5
 
@@ -41,6 +43,8 @@ class FileDialogAutomation:
     @staticmethod
     def find_dialog(timeout=15):
         """等待并找到 Windows 文件打开对话框"""
+        if _user32 is None:
+            return 0
         start = time.time()
         while time.time() - start < timeout:
             for title in ["打开", "Open", "选择要上传的文件"]:
@@ -101,6 +105,8 @@ class FileDialogAutomation:
         等待文件对话框出现 → 填入路径 → 点击打开。
         返回 (success: bool, message: str)
         """
+        if _user32 is None:
+            return False, '原生文件对话框自动填写仅支持 Windows，请使用全局托管模式的插件上传'
         hwnd = cls.find_dialog(timeout)
         if not hwnd:
             return False, "文件对话框未出现"
@@ -135,6 +141,8 @@ class FileDialogAutomation:
         用 Win32 mouse_event 在屏幕坐标 (x, y) 上模拟真实鼠标点击。
         这会产生被 Chrome 信任的输入事件（与 JavaScript click() 不同）。
         """
+        if _user32 is None:
+            raise RuntimeError('屏幕坐标点击仅支持 Windows')
         _user32.SetCursorPos(int(x), int(y))
         time.sleep(0.1)
         _user32.mouse_event(0x0002, 0, 0, 0, 0)   # MOUSEEVENTF_LEFTDOWN
@@ -144,13 +152,14 @@ class FileDialogAutomation:
 
 
 # 设置 DPI 感知，确保屏幕坐标正确
-try:
-    ctypes.windll.shcore.SetProcessDpiAwareness(1)  # PROCESS_SYSTEM_DPI_AWARE
-except Exception:
+if _user32 is not None:
     try:
-        _user32.SetProcessDPIAware()
+        ctypes.windll.shcore.SetProcessDpiAwareness(1)  # PROCESS_SYSTEM_DPI_AWARE
     except Exception:
-        pass
+        try:
+            _user32.SetProcessDPIAware()
+        except Exception:
+            pass
 
 
 class PipelineTabWidget(QWidget):

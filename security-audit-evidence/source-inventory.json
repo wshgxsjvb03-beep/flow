@@ -1,0 +1,194 @@
+[
+  {
+    "file": "models/batch_model.py",
+    "lines": 67
+  },
+  {
+    "file": "models/config_manager.py",
+    "lines": 302
+  },
+  {
+    "file": "models/project_model.py",
+    "lines": 279
+  },
+  {
+    "file": "models/storage_manager.py",
+    "lines": 143
+  },
+  {
+    "file": "models/template_manager.py",
+    "lines": 318
+  },
+  {
+    "file": "models/__init__.py",
+    "lines": 1
+  },
+  {
+    "file": "services/browser_closer.py",
+    "lines": 306
+  },
+  {
+    "file": "services/downloader.py",
+    "lines": 375
+  },
+  {
+    "file": "services/image_assignment.py",
+    "lines": 137
+  },
+  {
+    "file": "services/pipeline_scheduler.py",
+    "lines": 182
+  },
+  {
+    "file": "services/plugin_server.py",
+    "lines": 482
+  },
+  {
+    "file": "services/project_prompts.py",
+    "lines": 127
+  },
+  {
+    "file": "services/security.py",
+    "lines": 92
+  },
+  {
+    "file": "services/speech_extractor.py",
+    "lines": 560
+  },
+  {
+    "file": "services/text_processor.py",
+    "lines": 288
+  },
+  {
+    "file": "services/video_checker.py",
+    "lines": 437
+  },
+  {
+    "file": "services/video_relocation.py",
+    "lines": 67
+  },
+  {
+    "file": "services/__init__.py",
+    "lines": 1
+  },
+  {
+    "file": "views/batch_generate_tab.py",
+    "lines": 522
+  },
+  {
+    "file": "views/close_confirm_dialog.py",
+    "lines": 218
+  },
+  {
+    "file": "views/hosted_mode_widget.py",
+    "lines": 1222
+  },
+  {
+    "file": "views/image_assignment_dialog.py",
+    "lines": 339
+  },
+  {
+    "file": "views/import_dialog.py",
+    "lines": 299
+  },
+  {
+    "file": "views/main_window.py",
+    "lines": 850
+  },
+  {
+    "file": "views/pipeline_tab_widget.py",
+    "lines": 1101
+  },
+  {
+    "file": "views/project_detail_widget.py",
+    "lines": 3805
+  },
+  {
+    "file": "views/project_prompt_dialog.py",
+    "lines": 77
+  },
+  {
+    "file": "views/settings_dialog.py",
+    "lines": 517
+  },
+  {
+    "file": "views/template_config_dialog.py",
+    "lines": 596
+  },
+  {
+    "file": "views/video_check_dialog.py",
+    "lines": 595
+  },
+  {
+    "file": "views/video_compare_widget.py",
+    "lines": 1444
+  },
+  {
+    "file": "views/__init__.py",
+    "lines": 1
+  },
+  {
+    "file": "extension/background.js",
+    "lines": 319
+  },
+  {
+    "file": "extension/content-isolated.js",
+    "lines": 160
+  },
+  {
+    "file": "extension/manifest.json",
+    "lines": 76
+  },
+  {
+    "file": "extension/injects/flow-proxy.js",
+    "lines": 664
+  },
+  {
+    "file": "extension/injects/ui.css",
+    "lines": 745
+  },
+  {
+    "file": "extension/injects/ui.js",
+    "lines": 5738
+  },
+  {
+    "file": "tests/test_batch_progress.js",
+    "lines": 82
+  },
+  {
+    "file": "tests/test_end_frames.js",
+    "lines": 92
+  },
+  {
+    "file": "tests/test_flow_dom.js",
+    "lines": 279
+  },
+  {
+    "file": "tests/test_flow_response.js",
+    "lines": 23
+  },
+  {
+    "file": "tests/test_image_assignment.py",
+    "lines": 237
+  },
+  {
+    "file": "tests/test_merge_regressions.py",
+    "lines": 213
+  },
+  {
+    "file": "tests/test_project_prompts.py",
+    "lines": 160
+  },
+  {
+    "file": "tests/test_security.js",
+    "lines": 58
+  },
+  {
+    "file": "tests/test_security.py",
+    "lines": 182
+  },
+  {
+    "file": "tests/test_video_relocation.py",
+    "lines": 134
+  }
+]

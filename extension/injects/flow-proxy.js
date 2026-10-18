@@ -6,23 +6,8 @@
   
   console.log("[FlowProxy] 代理脚本注入成功，正在启动拦截...");
 
-  // ----------------------------------------------------
-  // 0. 适配 Trusted Types 安全策略 (针对 flow.google.com 等开启了 require-trusted-types-for 'script' 的站点)
-  // ----------------------------------------------------
-  if (typeof window !== "undefined" && window.trustedTypes && window.trustedTypes.createPolicy) {
-    try {
-      if (!window.trustedTypes.defaultPolicy) {
-        window.trustedTypes.createPolicy("default", {
-          createHTML: (string) => string,
-          createScript: (string) => string,
-          createScriptURL: (string) => string,
-        });
-        console.log("[FlowProxy] 成功在 document_start 注册 default TrustedTypePolicy！");
-      }
-    } catch (e) {
-      console.warn("[FlowProxy] 注册 default TrustedTypePolicy 提示:", e);
-    }
-  }
+  // Keep the host page's Trusted Types policy intact. This proxy does not
+  // require HTML or script sinks and must not register a global bypass policy.
 
   // Google Vids (docs.google.com) 使用 DOM 级自动化且包含 Object.prototype SEAL 检测，无需注入 Flow 专属的网络/原型钩子
   if (location.hostname === "docs.google.com") {
@@ -168,31 +153,39 @@
       .trim();
   }
 
+  function decodeBoQResponseText(rawText) {
+    const cleaned = cleanBoQResponseText(rawText);
+    try { return JSON.parse(cleaned); } catch (_) {}
+    // batchexecute may label its XSSI-prefixed, length-framed response as JSON.
+    // Parse complete JSON records rather than passing the prefix to response.json().
+    const records = [];
+    let pending = "";
+    for (const line of cleaned.split(/\r?\n/)) {
+      if (!pending && (!line.trim() || /^\d+$/.test(line.trim()))) continue;
+      pending += (pending ? "\n" : "") + line;
+      try {
+        records.push(JSON.parse(pending));
+        pending = "";
+      } catch (_) {}
+    }
+    return records.length && !pending.trim() ? records : cleaned;
+  }
+
   async function parseFetchResponse(response) {
     const contentType = response.headers.get("Content-Type") || "";
     try {
       if (contentType.includes("application/json")) {
-        return await response.json();
+        return decodeBoQResponseText(await response.text());
       } else if (contentType.includes("text/") || contentType.includes("application/x-javascript") || contentType.includes("application/javascript")) {
         let text = await response.text();
-        const cleaned = cleanBoQResponseText(text);
-        try {
-          return JSON.parse(cleaned);
-        } catch {
-          return cleaned;
-        }
+        return decodeBoQResponseText(text);
       } else if (contentType.includes("application/octet-stream") || contentType.includes("blob")) {
         return await response.blob();
       } else if (contentType.includes("form-data")) {
         return await response.formData();
       } else {
         let text = await response.text();
-        const cleaned = cleanBoQResponseText(text);
-        try {
-          return JSON.parse(cleaned);
-        } catch {
-          return cleaned;
-        }
+        return decodeBoQResponseText(text);
       }
     } catch (e) {
       console.warn("[FlowProxy] 解析普通响应体提示:", e);

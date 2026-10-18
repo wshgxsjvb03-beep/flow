@@ -34,3 +34,6 @@ account_monitor.json
 account_aliases.json
 hosted_mode.json
 batch_templates.json
+
+# Locally saved authenticated browser pages (third-party scripts/account data)
+/新建文件夹/

@@ -31,7 +31,7 @@ USER_SETTINGS_FILES = [
 
 def get_data_dir():
     """
-    用户设置的固定保存目录：%APPDATA%\\Flow口播工具
+    Flow 用户设置目录沿用历史路径 %APPDATA%\\Flow口播工具，兼容已有设置。
     与程序安装目录分离，重新安装 / 覆盖 / 卸载程序都不会丢失设置。
     首次使用时自动把程序目录中已有的设置迁移过来（已存在的文件不会被覆盖）。
     """
@@ -60,7 +60,8 @@ def get_data_dir():
                     break
             if not os.path.exists(dst) and name in ("prompt_templates.json", "camera_motions.json"):
                 example = name.replace(".json", ".example.json")
-                for source_dir in (old_dir, os.path.join(old_dir, "_internal")):
+                for source_dir in (old_dir, os.path.join(old_dir, "_internal"),
+                                   getattr(sys, '_MEIPASS', old_dir)):
                     source = os.path.join(source_dir, example)
                     if os.path.isfile(source):
                         shutil.copy2(source, dst)
@@ -108,39 +109,13 @@ def qt_message_handler(mode, context, message):
 
 def main():
     try:
-        # Set Windows taskbar icon (AppUserModelID) so the taskbar shows our custom icon
-        # instead of the default Python icon
-        try:
-            import ctypes
-            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("flow.oral.video.tool")
-        except Exception:
-            pass
-
         from PyQt6.QtWidgets import QApplication
         from PyQt6.QtCore import qInstallMessageHandler
-        from PyQt6.QtGui import QIcon
         from views.main_window import MainWindow
 
         qInstallMessageHandler(qt_message_handler)
         app = QApplication(sys.argv)
-        
-        # Set application icon from logo.ico
-        workspace_dir = get_workspace_dir()
-        icon_path = None
-        # 打包后 logo.ico 在 _internal 目录中 (PyInstaller datas)
-        candidates = [
-            os.path.join(workspace_dir, "logo.ico"),
-            os.path.join(workspace_dir, "_internal", "logo.ico"),
-        ]
-        if getattr(sys, '_MEIPASS', None):
-            candidates.insert(0, os.path.join(sys._MEIPASS, "logo.ico"))
-        for p in candidates:
-            if os.path.exists(p):
-                icon_path = p
-                break
-        if icon_path:
-            app_icon = QIcon(icon_path)
-            app.setWindowIcon(app_icon)
+        app.setApplicationName('Flow')
         
         window = MainWindow(get_data_dir())
         window.show()

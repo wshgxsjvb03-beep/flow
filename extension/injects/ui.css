@@ -218,6 +218,40 @@
 }
 
 /* 单元格控件样式 - 图片与名称 */
+.task-frame-pair {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  align-items: start;
+  gap: 10px;
+  min-width: 205px;
+}
+
+.task-frame-pair .task-frame-preview {
+  width: 96px;
+}
+
+.task-frame-preview[data-frame-role="last"] {
+  cursor: default;
+}
+
+.task-frame-role {
+  color: #c4b5fd;
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.task-frame-status {
+  color: var(--flow-text-secondary);
+  font-size: 10px;
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+}
+
+.task-frame-preview[data-preview-state="pending"] .task-frame-status,
+.task-frame-preview[data-preview-state="error"] .task-frame-status {
+  color: #fbbf24;
+}
+
 .cell-image-container {
   display: flex;
   flex-direction: column;

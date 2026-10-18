@@ -1,10 +1,28 @@
 // background.js - 后台 Service Worker，负责处理下载任务、路径重定向与配置持久化
 
 // 1. 监听来自 content-isolated.js 的消息
+function isTrustedPage(url) {
+  try {
+    const parsed = new URL(url);
+    const host = parsed.hostname;
+    return parsed.protocol === 'https:' && !parsed.username && !parsed.password &&
+      (!parsed.port || parsed.port === '443') &&
+      (host === 'flow.google.com' || host.endsWith('.flow.google.com') ||
+       host === 'labs.google' || host.endsWith('.labs.google') ||
+       (host === 'docs.google.com' && parsed.pathname.startsWith('/videos/')));
+  } catch (_) { return false; }
+}
+
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  if (sender.id !== chrome.runtime.id || sender.frameId !== 0 || sender.tab?.id == null ||
+      !isTrustedPage(sender.url) || !isTrustedPage(sender.tab.url) ||
+      !message || typeof message !== 'object' || Array.isArray(message)) {
+    sendResponse({ error: '消息来源不受信任' });
+    return;
+  }
   // 后台版本握手：用于检测「网页脚本已更新但插件后台仍是旧版本」的情况
   if (message.action === "getBgVersion") {
-    sendResponse({ version: "1.3.1-hosted", nativeDrag: !!(chrome.debugger && chrome.debugger.attach) });
+    sendResponse({ version: chrome.runtime.getManifest().version, nativeDrag: !!(chrome.debugger && chrome.debugger.attach) });
     return;
   }
   // 兼容旧桥接消息；不再用全局当前任务重命名任何下载。
@@ -13,7 +31,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return;
   }
 
-  console.log(`[Background] 📥 收到来自 content-isolated 的消息: action=${message.action}`, message);
+  console.log(`[Background] 收到操作: ${message.action}`);
 
   if (message.action === "download") {
     handleDownload(message.url, message.filename, { ...message.task, tabId: sender.tab?.id, frameId: sender.frameId })
@@ -29,6 +47,9 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
 
   if (message.action === "getDownloadStatus") {
+    if (!Number.isSafeInteger(message.downloadId) || message.downloadId < 0) {
+      sendResponse({ error: '下载 ID 无效' }); return;
+    }
     chrome.downloads.search({ id: message.downloadId }).then(items => {
       const item = items[0];
       console.log(`[Background] 查询 downloadId=${message.downloadId} 结果:`, item ? { state: item.state, error: item.error } : "不存在");
@@ -41,6 +62,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
 
   if (message.action === "getStorage") {
+    if (!Array.isArray(message.keys) || message.keys.length > 100 ||
+        message.keys.some(key => !isPageStorageKey(key))) {
+      sendResponse({ error: '存储键无效' }); return;
+    }
     chrome.storage.local.get(message.keys, (result) => {
       sendResponse(result);
     });
@@ -48,6 +73,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
 
   if (message.action === "setStorage") {
+    if (!message.data || typeof message.data !== 'object' || Array.isArray(message.data) ||
+        Object.keys(message.data).length > 100 || Object.keys(message.data).some(key => !isPageStorageKey(key))) {
+      sendResponse({ error: '存储数据无效' }); return;
+    }
     chrome.storage.local.set(message.data, () => {
       sendResponse({ success: true });
     });
@@ -97,6 +126,12 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
 });
 
+function isPageStorageKey(key) {
+  return typeof key === 'string' && key.length <= 1024 &&
+    (['settings', 'presets'].includes(key) ||
+     /^(tasks|taskRecord|downloadedUrls|isRunning|currentIndex|currentLineIndex|retryCount)_.+/.test(key));
+}
+
 // 2.0 原生文件拖放（移植自 FlowStudio 插件的已验证方案）
 // 原理：普通网页脚本 new File()/DataTransfer 伪造的拖放事件 isTrusted=false，Flow 会忽略；
 // 而 Chrome DevTools 协议 Input.dispatchDragEvent 由浏览器内核发出「真实」拖放，
@@ -110,15 +145,23 @@ function serialByTab(tabId, fn) {
 }
 
 async function dispatchNativeFileDrag(tabId, paths, x, y) {
+  if (!Array.isArray(paths) || paths.length > 100 || paths.some(p => typeof p !== 'string')) {
+    throw new Error('本地图片路径列表无效');
+  }
   const clean = [...new Set((paths || []).map(String).map(s => s.trim()).filter(Boolean))];
   if (!clean.length) throw new Error("没有可上传的本地文件路径");
 
   const ALLOWED_IMAGE_EXTS = new Set([".jpg", ".jpeg", ".png", ".webp", ".bmp"]);
   const validFiles = clean.filter(p => {
     const dot = p.lastIndexOf(".");
-    return dot !== -1 && ALLOWED_IMAGE_EXTS.has(p.substring(dot).toLowerCase());
+    // Reject network shares, device paths and NTFS alternate data streams.
+    const absolute = /^[A-Za-z]:[\\/]/.test(p) || (p.startsWith('/') && !p.startsWith('//'));
+    const rest = /^[A-Za-z]:/.test(p) ? p.slice(2) : p;
+    return absolute && !rest.includes(':') && !/[\x00-\x1f]/.test(p) &&
+      !p.startsWith('\\\\') && !rest.split(/[\\/]/).includes('..') &&
+      dot !== -1 && ALLOWED_IMAGE_EXTS.has(p.substring(dot).toLowerCase());
   });
-  if (!validFiles.length) {
+  if (!validFiles.length || validFiles.length !== clean.length) {
     throw new Error("安全拦截：原生拖放仅允许上传本地图片文件 (.jpg, .jpeg, .png, .webp, .bmp)");
   }
 
@@ -160,13 +203,15 @@ async function dispatchNativeFileDrag(tabId, paths, x, y) {
 // 2. 处理直接下载逻辑
 async function handleDownload(url, filename, task) {
   try {
-    console.log(`[Background] 🎬 handleDownload 启动: URL=${url}, Filename=${filename}, task=`, task);
+    console.log('[Background] 开始校验视频下载任务');
     // 规范化文件名中的斜杠，防止创建非法的多层级路径
     if (!task?.mediaId || !task.submissionId || !task.taskId || !filename || filename !== task.download_path) {
-      console.error("[Background] ❌ 拒绝下载: 缺少媒体 ID 或任务文件名绑定", { task, filename });
+      console.error("[Background] 拒绝下载: 缺少媒体 ID 或任务文件名绑定");
       throw new Error("缺少媒体 ID 或任务文件名绑定，拒绝下载");
     }
     const parsed = new URL(url);
+    if (parsed.protocol !== 'https:' || parsed.username || parsed.password ||
+        (parsed.port && parsed.port !== '443')) throw new Error('仅允许 HTTPS 媒体下载');
     const isVidsHost = (
       parsed.hostname.endsWith(".usercontent.google.com") ||
       parsed.hostname.endsWith(".googleusercontent.com") ||
@@ -192,7 +237,7 @@ async function handleDownload(url, filename, task) {
       throw new Error("下载地址的媒体 ID 与任务不一致");
     }
     const sanitizedFilename = filename.replace(/\\/g, "/").replace(/^\/+/, "");
-    if (sanitizedFilename.split("/").some(part => !part || part === "." || part === ".." || /[<>:"|?*]/.test(part))) {
+    if (sanitizedFilename.split("/").some(part => !part || part === "." || part === ".." || /[<>:"|?*\x00-\x1f]/.test(part))) {
       console.error(`[Background] ❌ 拒绝下载: 文件名包含非法字符: ${sanitizedFilename}`);
       throw new Error("下载文件名无效");
     }
@@ -202,7 +247,7 @@ async function handleDownload(url, filename, task) {
     }
     // 在 Chrome 触发文件命名事件之前保存这个 URL 的独立文件名。
     await chrome.storage.session.set({ [`filename_${url}`]: sanitizedFilename });
-    console.log(`[Background] 🚀 开始调用 Chrome API 下载视频: URL=${url}, Filename=${sanitizedFilename}`);
+    console.log('[Background] 开始调用 Chrome API 下载视频');
     
     return new Promise((resolve) => {
       chrome.downloads.download({
@@ -244,7 +289,7 @@ chrome.downloads.onDeterminingFilename.addListener((item, suggest) => {
   if (item.finalUrl) keys.push(`filename_${item.finalUrl}`);
   chrome.storage.session.get(keys).then(saved => {
     const filename = saved[`download_${item.id}`]?.filename || saved[`filename_${item.url}`] || (item.finalUrl ? saved[`filename_${item.finalUrl}`] : null);
-    console.log(`[Background] 📝 onDeterminingFilename: ID=${item.id}, URL=${item.url}, 匹配目标文件名=${filename}`);
+    console.log(`[Background] onDeterminingFilename: ID=${item.id}`);
     if (filename) suggest({ filename, conflictAction: "uniquify" });
     else suggest();
   }).catch(() => suggest());

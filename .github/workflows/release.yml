@@ -1,79 +1,177 @@
-name: Build and Release Application
+name: Build and Release Flow
 
 on:
   push:
     tags:
       - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing version tag to build, for example v1.8.1'
+        required: true
+        type: string
 
 permissions:
-  id-token: write
-  contents: write
-  attestations: write
+  contents: read
+
+concurrency:
+  group: flow-release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+  PYTHONUTF8: '1'
+  QT_QPA_PLATFORM: offscreen
 
 jobs:
-  build:
-    name: Build on ${{ matrix.os }}
-    runs-on: ${{ matrix.os }}
-    strategy:
-      matrix:
-        os: [windows-latest, macos-latest]
-
+  validate:
+    name: Validate release tag
+    runs-on: ubuntu-24.04
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - name: Validate version before using it in paths
+        run: |
+          python3 - <<'PY'
+          import os, re
+          tag = os.environ['RELEASE_TAG']
+          if not re.fullmatch(r'v[0-9][A-Za-z0-9._-]*', tag):
+              raise SystemExit('Use an existing version tag such as v1.8.1')
+          PY
+
+  desktop:
+    name: Build ${{ matrix.target }}
+    needs: validate
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: windows
+            runner: windows-2025
+            python_arch: x64
+            arch: x86_64
+          - target: macos-arm64
+            runner: macos-15
+            python_arch: arm64
+            arch: arm64
+          - target: macos-x86_64
+            runner: macos-15-intel
+            python_arch: x64
+            arch: x86_64
+    env:
+      RELEASE_ARCH: ${{ matrix.arch }}
+    steps:
+      - name: Checkout release tag
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: refs/tags/${{ env.RELEASE_TAG }}
+          persist-credentials: false
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: '3.11'
+          architecture: ${{ matrix.python_arch }}
 
       - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install pyinstaller -r requirements.txt
+        run: python -m pip install pyinstaller==6.22.3 -r requirements.txt
 
-      - name: Build executable (Windows)
-        if: matrix.os == 'windows-latest'
+      - name: Run Python regression tests
+        run: python -m unittest discover -s tests -v
+
+      - name: Build desktop application
+        run: python -m PyInstaller --noconfirm flow.spec
+
+      - name: Package Windows
+        if: runner.os == 'Windows'
         shell: pwsh
-        env:
-          TAG_NAME: ${{ github.ref_name }}
+        run: python scripts/package_release.py windows --tag "$env:RELEASE_TAG"
+
+      - name: Prepare and package macOS app
+        if: runner.os == 'macOS'
         run: |
-          pyinstaller --noconfirm flow.spec
-          cp camera_motions.example.json dist/flow/camera_motions.json
-          cp prompt_templates.example.json dist/flow/prompt_templates.json
-          if (Test-Path camera_motions.example.json) { cp camera_motions.example.json dist/flow/ }
-          if (Test-Path prompt_templates.example.json) { cp prompt_templates.example.json dist/flow/ }
-          if (Test-Path .app_config.example.json) { cp .app_config.example.json dist/flow/ }
-          if (Test-Path .env.example) { cp .env.example dist/flow/ }
-          cp LICENSE dist/flow/
-          cp LICENSE.LIST dist/flow/
-          cd dist
-          Compress-Archive -Path flow -DestinationPath "flow-windows-$env:TAG_NAME.zip"
+          python scripts/package_release.py prepare-macos --tag "$RELEASE_TAG"
+          codesign --force --deep --sign - dist/Flow.app
+          codesign --verify --deep --strict dist/Flow.app
+          test -x dist/Flow.app/Contents/MacOS/Flow
+          mkdir -p artifacts
+          ditto -c -k --sequesterRsrc --keepParent dist/Flow.app "artifacts/Flow-macos-${RELEASE_ARCH}-${RELEASE_TAG}.zip"
 
-      - name: Build executable (macOS)
-        if: matrix.os == 'macos-latest'
-        env:
-          TAG_NAME: ${{ github.ref_name }}
+      - name: Upload desktop package for final release
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: flow-${{ matrix.target }}
+          path: artifacts/*.zip
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+
+  extension:
+    name: Package standalone browser extension
+    needs: validate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Checkout release tag
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: refs/tags/${{ env.RELEASE_TAG }}
+          persist-credentials: false
+
+      - name: Check extension JavaScript
         run: |
-          pyinstaller --noconfirm flow.spec
-          cp camera_motions.example.json dist/flow/camera_motions.json
-          cp prompt_templates.example.json dist/flow/prompt_templates.json
-          if [ -f camera_motions.example.json ]; then cp camera_motions.example.json dist/flow/; fi
-          if [ -f prompt_templates.example.json ]; then cp prompt_templates.example.json dist/flow/; fi
-          if [ -f .app_config.example.json ]; then cp .app_config.example.json dist/flow/; fi
-          if [ -f .env.example ]; then cp .env.example dist/flow/; fi
-          cp LICENSE dist/flow/
-          cp LICENSE.LIST dist/flow/
-          cd dist
-          zip -r "flow-macos-${TAG_NAME}.zip" flow
+          find extension -name '*.js' -print0 | xargs -0 -n 1 node --check
+          node tests/test_batch_progress.js
+          node tests/test_end_frames.js
+          node tests/test_flow_response.js
 
-      - name: Attest Build Provenance
-        uses: actions/attest-build-provenance@v2
-        with:
-          subject-path: 'dist/*.zip'
+      - name: Package manifest and declared extension resources
+        run: python3 scripts/package_release.py extension --tag "$RELEASE_TAG"
 
-      - name: Create Release
-        uses: softprops/action-gh-release@v2
+      - name: Upload extension package for final release
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          files: dist/*.zip
+          name: flow-extension
+          path: artifacts/*.zip
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+
+  release:
+    name: Publish the three release packages
+    needs: [desktop, extension]
+    runs-on: macos-15
+    timeout-minutes: 20
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - name: Checkout release tag
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: refs/tags/${{ env.RELEASE_TAG }}
+          persist-credentials: false
+
+      - name: Download packages from this workflow run
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: flow-*
+          path: incoming
+          merge-multiple: true
+
+      - name: Combine both Mac architectures and verify exactly three packages
+        run: python3 scripts/package_release.py collect --tag "$RELEASE_TAG" --output release
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
+        with:
+          subject-path: 'release/*.zip'
+
+      - name: Publish release
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        with:
+          tag_name: ${{ env.RELEASE_TAG }}
+          files: release/*.zip
+          fail_on_unmatched_files: true
           generate_release_notes: true

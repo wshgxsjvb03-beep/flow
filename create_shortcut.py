@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Creates a desktop shortcut for Flow口播工具 with logo.ico icon"""
+"""Creates a desktop shortcut for Flow without a custom icon."""
 import os
 import sys
 import subprocess
@@ -9,12 +9,11 @@ app_dir = os.path.dirname(os.path.abspath(__file__))
 
 ps_script = f'''
 $WshShell = New-Object -ComObject WScript.Shell
-$Shortcut = $WshShell.CreateShortcut("{desktop}\\Flow口播工具.lnk")
+$Shortcut = $WshShell.CreateShortcut("{desktop}\\Flow.lnk")
 $Shortcut.TargetPath = "pythonw"
 $Shortcut.Arguments = "main.py"
 $Shortcut.WorkingDirectory = "{app_dir}"
-$Shortcut.IconLocation = "{app_dir}\\logo.ico"
-$Shortcut.Description = "Flow口播工具 - AI视频批量制作"
+$Shortcut.Description = "Flow - AI视频批量制作"
 $Shortcut.Save()
 '''
 
@@ -24,8 +23,7 @@ result = subprocess.run(
 )
 
 if result.returncode == 0:
-    print("[OK] Desktop shortcut created: " + desktop + "\\Flow口播工具.lnk")
-    print("     Icon: " + app_dir + "\\logo.ico")
+    print("[OK] Desktop shortcut created: " + desktop + "\\Flow.lnk")
 else:
     print("[FAIL] " + result.stderr)
     sys.exit(1)

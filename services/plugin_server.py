@@ -1,6 +1,9 @@
 # -*- coding: utf-8 -*-
 import json
 import logging
+import re
+import sys
+from urllib.parse import urlsplit
 from PyQt6.QtCore import QObject, pyqtSignal
 from PyQt6.QtWebSockets import QWebSocketServer, QWebSocket
 from PyQt6.QtNetwork import QHostAddress
@@ -78,17 +81,21 @@ class PluginServer(QObject):
         """Verifies if the incoming WebSocket connection Origin is authorized to prevent CSWSH."""
         if not origin:
             return True  # Native desktop / test clients do not supply an Origin header
-        import urllib.parse
         try:
-            parsed = urllib.parse.urlparse(origin)
+            if not isinstance(origin, str) or any(ord(c) < 32 for c in origin):
+                return False
+            parsed = urlsplit(origin)
             host = (parsed.hostname or "").lower()
-            if origin.startswith("chrome-extension://") or origin.startswith("file://"):
-                return True
-            allowed_hosts = {"labs.google", "flow.google.com", "docs.google.com", "localhost", "127.0.0.1"}
-            if host in allowed_hosts or host.endswith(".labs.google") or host.endswith(".flow.google.com") or host == "docs.google.com":
-                return True
-        except Exception as e:
-            logger.warning(f"Error parsing origin {origin}: {e}")
+            if parsed.username is not None or parsed.password is not None or parsed.path or parsed.query or parsed.fragment:
+                return False
+            if parsed.scheme == 'chrome-extension':
+                return bool(re.fullmatch(r'[a-p]{32}', host)) and parsed.port is None
+            allowed_hosts = {"labs.google", "flow.google.com", "docs.google.com"}
+            return (parsed.scheme == 'https' and parsed.port in (None, 443)
+                    and (host in allowed_hosts or host.endswith(".labs.google")
+                         or host.endswith(".flow.google.com")))
+        except (TypeError, ValueError):
+            pass
         return False
 
     def on_new_connection_from_server(self, server):
@@ -104,6 +111,10 @@ class PluginServer(QObject):
             logger.warning(f"🚨 Blocked unauthorized WebSocket connection from untrusted origin: {origin}")
             socket.abort()
             return
+
+        # Large enough for video reports, but bounded before Qt buffers frames.
+        socket.setMaxAllowedIncomingMessageSize(128 * 1024 * 1024)
+        socket.setMaxAllowedIncomingFrameSize(128 * 1024 * 1024)
         
         temp_id = f"Worker_{self.client_id_counter}"
         self.client_id_counter += 1
@@ -126,6 +137,8 @@ class PluginServer(QObject):
         # Fetch profile async to not block
         import threading
         def fetch_profile():
+            if sys.platform != 'win32':
+                return
             try:
                 from services.browser_closer import get_browser_profile_by_port
                 prof = get_browser_profile_by_port(socket.peerPort())
@@ -165,6 +178,10 @@ class PluginServer(QObject):
             msg = json.loads(message_str)
         except Exception as e:
             logger.warning(f"Invalid JSON received from {info.get('client_id')}: {e}")
+            return
+
+        if not self._valid_message(msg):
+            logger.warning("Rejected malformed plugin message")
             return
 
         msg_type = msg.get("type") or msg.get("event") or msg.get("action")
@@ -238,7 +255,7 @@ class PluginServer(QObject):
         # 2. 状态/点数实时更新
         if msg_type == "status_update":
             if "remaining_points" in msg:
-                info["remaining_points"] = int(msg.get("remaining_points", 0))
+                info["remaining_points"] = int(msg.get("remaining_points") or 0)
             if "status" in msg:
                 info["status"] = msg.get("status")
             self.client_updated_signal.emit(info)
@@ -284,7 +301,7 @@ class PluginServer(QObject):
         # 4. JSON-RPC 开放接口响应 (如 get_points_response, upload_image_response, generate_video_response)
         elif str(msg_type).endswith("_response") or "request_id" in msg:
             if "data" in msg and isinstance(msg["data"], dict) and "remaining_points" in msg["data"]:
-                info["remaining_points"] = int(msg["data"]["remaining_points"])
+                info["remaining_points"] = int(msg["data"]["remaining_points"] or 0)
                 self.client_updated_signal.emit(info)
             
             logger.info(f"RPC Response received [{msg_type}] from {info['client_id']}")
@@ -305,6 +322,33 @@ class PluginServer(QObject):
 
         elif msg_type == "pong":
             pass
+
+    @staticmethod
+    def _valid_message(msg):
+        if not isinstance(msg, dict):
+            return False
+        for key in ('type', 'event', 'action', 'email', 'name', 'client_id', 'status'):
+            if key in msg and (not isinstance(msg[key], str) or len(msg[key]) > 1024):
+                return False
+        for obj in (msg, msg.get('data')):
+            if not isinstance(obj, dict):
+                continue
+            for key in ('email', 'name', 'client_id'):
+                if key in obj and not isinstance(obj[key], str):
+                    return False
+            for key in ('credits', 'remaining_points'):
+                if key in obj and obj[key] is not None:
+                    try:
+                        value = int(obj[key])
+                        if not 0 <= value <= 10**9:
+                            return False
+                    except (TypeError, ValueError, OverflowError):
+                        return False
+        if (msg.get('type') or msg.get('event') or msg.get('action')) == 'execution_report':
+            data = msg.get('data', [])
+            if not isinstance(data, list) or len(data) > 10000 or any(not isinstance(item, dict) for item in data):
+                return False
+        return True
 
     def send_rpc_action(self, client_id, action, params=None, request_id=None):
         """
@@ -359,27 +403,36 @@ class PluginServer(QObject):
         from pathlib import Path
 
         processed_tasks = []
+        encoded_images = {}  # Reuse shared first/end frames only within this send.
         for task in tasks_data:
             task_copy = dict(task)
-            img_path = task_copy.get("local_image_path")
-            
-            if img_path:
-                try:
-                    p = Path(img_path)
-                    if p.is_file() and p.suffix.lower() in [".jpg", ".jpeg", ".png", ".webp", ".gif"]:
-                        # Limit to 50MB to prevent memory exhaustion
-                        if p.stat().st_size <= 50 * 1024 * 1024:
-                            ext = p.suffix.lower().replace(".", "")
-                            if ext == "jpg":
-                                ext = "jpeg"
-                            mime = f"image/{ext}"
-                            with open(p, "rb") as f:
-                                b64_str = base64.b64encode(f.read()).decode("utf-8")
-                                task_copy["image_data_url"] = f"data:{mime};base64,{b64_str}"
-                        else:
-                            logger.warning(f"Image {img_path} exceeds 50MB limit, skipping base64 encoding")
-                except Exception as err:
-                    logger.warning(f"Failed to read image {img_path} for base64 encoding: {err}")
+            for path_key, data_key in (
+                ("local_image_path", "image_data_url"),
+                ("end_local_image_path", "end_image_data_url"),
+            ):
+                img_path = task_copy.get(path_key)
+                if img_path:
+                    try:
+                        p = Path(img_path)
+                        if p.is_file() and p.suffix.lower() in [".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp"]:
+                            # Limit to 50MB to prevent memory exhaustion
+                            stat = p.stat()
+                            if stat.st_size <= 50 * 1024 * 1024:
+                                cache_key = (str(p.resolve()), stat.st_size, stat.st_mtime_ns)
+                                if cache_key not in encoded_images:
+                                    ext = p.suffix.lower().replace(".", "")
+                                    if ext == "jpg":
+                                        ext = "jpeg"
+                                    with open(p, "rb") as f:
+                                        b64_str = base64.b64encode(f.read()).decode("utf-8")
+                                    encoded_images[cache_key] = f"data:image/{ext};base64,{b64_str}"
+                                task_copy[data_key] = encoded_images[cache_key]
+                                alias = "imageDataUrl" if data_key == "image_data_url" else "endImageDataUrl"
+                                task_copy[alias] = task_copy[data_key]
+                            else:
+                                logger.warning(f"Image {img_path} exceeds 50MB limit, skipping base64 encoding")
+                    except Exception as err:
+                        logger.warning(f"Failed to read image {img_path} for base64 encoding: {err}")
 
             processed_tasks.append(task_copy)
 

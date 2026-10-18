@@ -14,19 +14,10 @@
     try {
       flowTrustedPolicy = window.trustedTypes.createPolicy("flow-ui-policy", {
         createHTML: (s) => s,
-        createScript: (s) => s,
-        createScriptURL: (s) => s,
       });
     } catch (e) {
-      try {
-        flowTrustedPolicy = window.trustedTypes.createPolicy("default", {
-          createHTML: (s) => s,
-          createScript: (s) => s,
-          createScriptURL: (s) => s,
-        });
-      } catch (err) {
-        flowTrustedPolicy = window.trustedTypes.defaultPolicy || null;
-      }
+      // Never install a permissive global default policy on the host page.
+      flowTrustedPolicy = null;
     }
   }
 
@@ -57,6 +48,11 @@
         }
       }
     }
+  }
+
+  function escapeHTML(value) {
+    return String(value ?? "").replace(/[&<>"']/g, char =>
+      ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[char]);
   }
 
   // ----------------------------------------------------
@@ -210,6 +206,9 @@
 
   // 从 Storage 读取配置和状态
   async function loadState() {
+    // Opening the panel during a queue must not replace the live task objects
+    // held by runBatch while download broadcasts update state.tasks.
+    if (batchPromise) return;
     const key = getStorageKey();
     state.activeProjectId = key;
     
@@ -219,6 +218,9 @@
         `isRunning_${key}`, `currentIndex_${key}`, `currentLineIndex_${key}`, `retryCount_${key}`
       ]
     });
+
+    // A queue can start while the storage request is still in flight.
+    if (batchPromise || key !== getStorageKey()) return;
     
     if (saved) {
       if (saved.error) {
@@ -342,7 +344,7 @@
     overlayEl = document.createElement("div");
     overlayEl.id = "flow-batch-overlay";
     const panelTitleText = isVidsPage()
-      ? "FlowCue · Google Vids 逐个生成与自动下载助手 (无 50 积分限制)"
+      ? "Flow · Google Vids 逐个生成与自动下载助手 (无 50 积分限制)"
       : "Flow 批量生成与自动下载助手";
     setSafeHTML(overlayEl, `
       <div id="flow-batch-panel">
@@ -362,7 +364,7 @@
             <table class="flow-table" id="flow-tasks-table">
               <thead>
                 <tr>
-                  <th style="width: 115px; text-align: center;">图片</th>
+                  <th style="width: 220px; text-align: center;">首帧 / 尾帧</th>
                   <th>提示词文本 (分行分割)</th>
                   <th style="width: 145px;">提示词模板</th>
                   <th style="width: 135px;">素材类型</th>
@@ -805,7 +807,7 @@
 
       await openPanel();
       openImportDialog();
-      showToast("🎬 请先在 FlowCue 软件中点击「复制任务 JSON」，然后粘贴导入或再次点击 🎬 按钮", 6000);
+      showToast("🎬 请先在 Flow 软件中点击「复制任务 JSON」，然后粘贴导入或再次点击 🎬 按钮", 6000);
     } catch (e) {
       console.error("[FlowUI] [Vids] 一键执行异常:", e);
       showToast(`🎬 Vids 一键执行出错：${e.message}`, 6000);
@@ -886,7 +888,7 @@
       const item = document.createElement("div");
       item.style.cssText = "display:flex; justify-content:space-between; align-items:center; background:rgba(255,255,255,0.03); padding:6px 12px; border-radius:6px; border:1px solid var(--flow-border-glass);";
       setSafeHTML(item, `
-        <span style="font-size:12px; font-weight:500;">${preset.name}</span>
+        <span style="font-size:12px; font-weight:500;">${escapeHTML(preset.name)}</span>
         <button class="flow-btn secondary" style="font-size:10px; padding:4px 8px; color:#ef4444; border-color:rgba(239,68,68,0.2);" data-idx="${index}">删除</button>
       `);
       item.querySelector("button").addEventListener("click", (e) => {
@@ -1117,8 +1119,8 @@
         const taskName = task.image?.displayName || "";
         const localName = getFilenameFromPath(task.image?.localImagePath || task.local_image_path);
         const matched = images.find(img => 
-          (taskName && isImageNameMatch(taskName, img.displayName)) || 
-          (localName && isImageNameMatch(localName, img.displayName))
+          (taskName && exactFlowImageName(taskName) === exactFlowImageName(img.displayName)) ||
+          (localName && exactFlowImageName(localName) === exactFlowImageName(img.displayName))
         );
         if (matched) {
           task.image = {
@@ -1173,12 +1175,34 @@
 
   // 严格比对：避免模糊关键词匹配把「同人物不同编号」的图误判为已上传
   function isStrictImageMatch(targetName, pageName) {
-    const a = cleanCompactName(targetName), b = cleanCompactName(pageName);
-    if (!a || !b) return false;
-    if (a === b) return true;
-    // Flow 卡片名称可能被截断：较长的一方以较短一方开头，且较短一方足够长
-    const [s, l] = a.length <= b.length ? [a, b] : [b, a];
-    return s.length >= 12 && l.startsWith(s);
+    const a = exactFlowImageName(targetName), b = exactFlowImageName(pageName);
+    return !!a && !!b && a === b;
+  }
+
+  function normalizeEndImage(item, pageImages = []) {
+    const original = item.endImage || {};
+    const path = item.end_local_image_path || item.endLocalImagePath || original.localImagePath || "";
+    const name = item.end_image_name || item.endImageName || original.displayName || getFilenameFromPath(path);
+    const src = item.end_image_data_url || item.endImageDataUrl || item.end_image_url || original.src || "";
+    if (!name && !path && !src && !original.primaryMediaKey && !original.id) return null;
+    const matched = pageImages.find(img => exactFlowImageName(name) === exactFlowImageName(img.displayName));
+    return { ...original, ...(matched || {}), displayName: name || "尾帧图片",
+      localImagePath: path, src: matched?.src || src };
+  }
+
+  function getTaskFrameReceipt(tasks) {
+    return tasks.map((task, row) => ({ row,
+      first: task.image?.displayName || "", last: task.endImage?.displayName || "" }));
+  }
+
+  function resolveTaskImages(task, pageImages) {
+    for (const key of ["image", "endImage"]) {
+      const image = task[key];
+      if (!image) continue;
+      const matched = findStrictPageImage({ image }, pageImages);
+      if (matched) task[key] = { ...image, ...matched, displayName: image.displayName || matched.displayName,
+        localImagePath: image.localImagePath };
+    }
   }
 
   function getTaskUploadName(task) {
@@ -1187,7 +1211,8 @@
 
   function findStrictPageImage(task, pageImages) {
     const names = [getTaskUploadName(task), task.image?.displayName].filter(Boolean);
-    return pageImages.find(img => names.some(n => isStrictImageMatch(n, img.displayName))) || null;
+    const matches = pageImages.filter(img => names.some(n => exactFlowImageName(n) === exactFlowImageName(img.displayName)));
+    return matches.length === 1 ? matches[0] : null;
   }
 
   // 找出「有本地路径但 Flow 页面中还没有」的任务
@@ -1198,10 +1223,15 @@
       if (rowFilter !== null && idx !== rowFilter) return;
       if (!splitTextToLines(task.text).length) return;
       if ((task.status || []).length && task.status.every(s => s === "success")) return;
-      const path = task.image?.localImagePath || task.local_image_path || "";
-      if (!path || !/^([a-zA-Z]:[\\/]|\/|\\\\)/.test(path)) return; // 必须是绝对路径
-      if (findStrictPageImage(task, pageImages)) return;
-      out.push({ idx, task, path, name: getTaskUploadName(task) });
+      for (const key of ["image", "endImage"]) {
+        const image = task[key];
+        if (!image) continue;
+        const imageTask = { image };
+        const path = image.localImagePath || (key === "image" ? task.local_image_path : "") || "";
+        if (!path || !/^([a-zA-Z]:[\\/]|\/|\\\\)/.test(path)) continue;
+        if (findStrictPageImage(imageTask, pageImages)) continue;
+        out.push({ idx, task: imageTask, path, name: getTaskUploadName(imageTask) });
+      }
     });
     // 同一张图被多个任务使用时只上传一次
     const seen = new Set();
@@ -1320,10 +1350,7 @@
       const pageImages = getLoadedPageImages();
       state.tasks.forEach((task, idx) => {
         if (rowFilter !== null && idx !== rowFilter) return;
-        const m = findStrictPageImage(task, pageImages);
-        if (m) {
-          task.image = { ...m, src: m.src, displayName: task.image?.displayName || m.displayName, localImagePath: task.image?.localImagePath || task.local_image_path };
-        }
+        resolveTaskImages(task, pageImages);
       });
       await saveState();
 
@@ -1471,14 +1498,14 @@
       const localImagePath = item.local_image_path || item.localImagePath || item.path || "";
       const localFileName = getFilenameFromPath(localImagePath);
       // 支持直接在 JSON 中传入网络图片或 Base64 DataURL
-      const incomingSrc = item.image_url || item.imageUrl || item.src || item.image_src || item.base64 || item.image_base64 || item.dataUrl || "";
+      const incomingSrc = item.image_data_url || item.imageDataUrl || item.image_url || item.imageUrl || item.src || item.image_src || item.base64 || item.image_base64 || item.dataUrl || "";
 
       // 图片查找匹配逻辑：采用多维度智能图名比对 (归一化、中英文括号、序号一致性、关键词交集)
       let matchedImg = null;
       if (imageName || localFileName) {
         matchedImg = loadedImages.find(img => {
-          return (imageName && isImageNameMatch(imageName, img.displayName)) ||
-                 (localFileName && isImageNameMatch(localFileName, img.displayName));
+          return (imageName && exactFlowImageName(imageName) === exactFlowImageName(img.displayName)) ||
+                 (localFileName && exactFlowImageName(localFileName) === exactFlowImageName(img.displayName));
         });
       }
 
@@ -1496,7 +1523,7 @@
         finalTaskImage = {
           ...matchedImg,
           src: matchedImg.src || incomingSrc,
-          displayName: matchedImg.displayName || finalDisplayName,
+          displayName: finalDisplayName,
           localImagePath: localImagePath
         };
       } else {
@@ -1568,6 +1595,7 @@
 
       state.tasks.push({
         image: finalTaskImage,
+        endImage: normalizeEndImage(item, loadedImages),
         text: prompt,
         preset: "无模版(直接填入)",
         footageType: mode,
@@ -1634,6 +1662,51 @@
   // ----------------------------------------------------
   // 6. 任务表格渲染
   // ----------------------------------------------------
+  function createTaskFramePreview(image, frameRole, rowIndex) {
+    const label = frameRole === "last" ? "尾帧" : "首帧";
+    const container = document.createElement("div");
+    container.className = "cell-image-container task-frame-preview";
+    container.dataset.frameRole = frameRole;
+    container.dataset.row = rowIndex;
+    container.title = image ? [label, image.displayName || "", image.localImagePath || ""].filter(Boolean).join("\n") : `${label}未设置`;
+    const heading = document.createElement("span");
+    heading.className = "task-frame-role";
+    heading.textContent = label;
+    container.appendChild(heading);
+    const src = image?.src || (image?.primaryMediaKey?.startsWith("http") ? image.primaryMediaKey : "");
+    const box = document.createElement("div");
+    box.className = "cell-image-box " + (src ? "has-image" : "no-image");
+    const status = document.createElement("span");
+    status.className = "task-frame-status";
+    if (src) {
+      const img = document.createElement("img");
+      img.className = "cell-image-preview";
+      img.alt = `${label}：${image.displayName || "图片"}`;
+      img.src = src;
+      img.addEventListener("error", () => {
+        status.textContent = "预览加载失败";
+        container.dataset.previewState = "error";
+      });
+      box.appendChild(img);
+      status.textContent = image.id || image.primaryMediaKey ? "已匹配网页素材" : src.startsWith("data:") ? "已收到图片数据" : "已有图片预览";
+      container.dataset.previewState = "ready";
+    } else {
+      const hint = document.createElement("span");
+      hint.className = "cell-image-pick-text";
+      hint.textContent = image ? "待匹配图片" : "未设置";
+      box.appendChild(hint);
+      status.textContent = !image ? "本任务未设置" : image.localImagePath ? "已收到路径，待上传" : "仅有名称，待匹配";
+      container.dataset.previewState = image ? "pending" : "unset";
+    }
+    container.appendChild(box);
+    const name = document.createElement("span");
+    name.className = "cell-image-name";
+    name.textContent = image?.displayName || (frameRole === "first" ? "未选择首帧" : "无尾帧");
+    name.title = image?.displayName || name.textContent;
+    container.append(name, status);
+    return container;
+  }
+
   function renderTable() {
     const tbody = document.querySelector("#flow-tasks-table tbody");
     if (!tbody) return;
@@ -1647,8 +1720,8 @@
           const taskName = task.image?.displayName || "";
           const localName = getFilenameFromPath(task.image?.localImagePath || task.local_image_path);
           const matched = pageImages.find(img => 
-            (taskName && isImageNameMatch(taskName, img.displayName)) || 
-            (localName && isImageNameMatch(localName, img.displayName))
+            (taskName && exactFlowImageName(taskName) === exactFlowImageName(img.displayName)) ||
+            (localName && exactFlowImageName(localName) === exactFlowImageName(img.displayName))
           );
           if (matched) {
             task.image = {
@@ -1678,40 +1751,17 @@
       
       // 1. 图片预览与名称展示列
       const imgTd = document.createElement("td");
-      imgTd.style.width = "115px";
+      imgTd.style.width = "220px";
       imgTd.style.textAlign = "center";
-      
-      const imgPreviewSrc = task.image?.src || (task.image?.primaryMediaKey?.startsWith("http") ? task.image.primaryMediaKey : "");
-      const taskDisplayName = task.image?.displayName || "未命名素材";
-
-      if (imgPreviewSrc) {
-        setSafeHTML(imgTd, `
-          <div class="cell-image-container" title="点击可更换本地图片预览" data-row="${rowIndex}">
-            <div class="cell-image-box has-image">
-              <img class="cell-image-preview" src="${imgPreviewSrc}" alt="预览" />
-              <div class="cell-image-hover-mask">更换</div>
-            </div>
-            <span class="cell-image-name" title="${taskDisplayName}">${taskDisplayName}</span>
-          </div>
-        `);
-      } else {
-        setSafeHTML(imgTd, `
-          <div class="cell-image-container" title="未关联图像，点击可直接选择本地图片预览" data-row="${rowIndex}">
-            <div class="cell-image-box no-image">
-              <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8">
-                <rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect>
-                <circle cx="8.5" cy="8.5" r="1.5"></circle>
-                <polyline points="21 15 16 10 5 21"></polyline>
-              </svg>
-              <span class="cell-image-pick-text">选图</span>
-            </div>
-            <span class="cell-image-name" title="${taskDisplayName}">${taskDisplayName}</span>
-          </div>
-        `);
-      }
+      resolveTaskImages(task, pageImages);
+      const pair = document.createElement("div");
+      pair.className = "task-frame-pair";
+      pair.append(createTaskFramePreview(task.image, "first", rowIndex),
+                  createTaskFramePreview(task.endImage, "last", rowIndex));
+      imgTd.appendChild(pair);
 
       // 绑定点击本地选图/换图预览功能
-      const imgContainer = imgTd.querySelector(".cell-image-container");
+      const imgContainer = imgTd.querySelector('.cell-image-container[data-frame-role="first"]');
       if (imgContainer) {
         imgContainer.addEventListener("click", () => {
           const fileInput = document.createElement("input");
@@ -1861,6 +1911,16 @@
       });
       actionTd.appendChild(runBtn);
 
+      const checkBtn = document.createElement("button");
+      checkBtn.className = "flow-btn";
+      checkBtn.textContent = "检查首尾帧";
+      checkBtn.title = "同步设置、填写第一段提示词并挂载首尾帧；不会点击生成";
+      checkBtn.addEventListener("click", event => {
+        event.stopPropagation();
+        checkTaskFrames(rowIndex);
+      });
+      actionTd.appendChild(checkBtn);
+
       const delBtn = document.createElement("button");
       delBtn.className = "cell-btn-delete";
       delBtn.title = "单独删除此项任务配置";
@@ -1922,11 +1982,11 @@
       } else if (status === "success") {
         badgeHtml = `<span class="status-badge success">✓ 成功</span>`;
       } else if (status === "failed") {
-        badgeHtml = `<span class="status-badge failed" title="${message}">✗ 失败</span>`;
+        badgeHtml = `<span class="status-badge failed" title="${escapeHTML(message)}">✗ 失败</span>`;
       }
 
       setSafeHTML(lineRow, `
-        <span class="status-line-text" title="${line}">#${lineIdx+1}: ${line}</span>
+        <span class="status-line-text" title="${escapeHTML(line)}">#${lineIdx+1}: ${escapeHTML(line)}</span>
         <div class="status-line-actions">
           ${badgeHtml}
           ${status !== "pending" && status !== "generating" ? `
@@ -2008,35 +2068,57 @@
 
   // 清理 Flow 页面上的历史弹窗、菜单、全屏预览与 backdrop，保证操作视口清空
   async function cleanupPageOverlays() {
-    try {
-      document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", code: "Escape", bubbles: true }));
-      const backdrops = document.querySelectorAll(".cdk-overlay-backdrop");
-      backdrops.forEach(bd => {
-        try { bd.click(); } catch (_) {}
-      });
-
-      // 若意外打开了素材/大图详情面板，自动点击返回或关闭按钮退出大图模式（兼容简中/繁中/英文）
-      const detailExitBtn = document.querySelector(
-        "button[aria-label='返回'], button[aria-label='Back'], button[aria-label='关闭'], button[aria-label='關閉'], button[aria-label='Close'], .asset-detail-back, flow-asset-detail button:first-child"
-      );
-      if (detailExitBtn && !detailExitBtn.disabled) {
-        console.log("[FlowUI] 检测到大图/素材详情面板，自动点击退出");
-        try { detailExitBtn.click(); } catch (_) {}
-      }
-
-      const mainContainer = document.querySelector("flow-project-page, .project-container, body");
-      if (mainContainer) {
-        mainContainer.dispatchEvent(new MouseEvent("click", { bubbles: true }));
-      }
-      await delay(200);
-    } catch (e) {
-      console.warn("[FlowUI] 清理页面遮罩提示:", e);
+    const picker = document.querySelector(".cdk-overlay-pane flow-add-menu-popover-content");
+    if (picker) {
+      const close = picker.querySelector("button.header-close-btn");
+      if (!close) throw new Error("图片窗口缺少关闭按钮");
+      close.click();
+      await waitForFlowState(() => !picker.isConnected, "图片窗口未关闭");
+    }
+    const settings = document.querySelector("flow-prompt-box-settings, .settings-content-overlay");
+    if (settings) {
+      const trigger = document.querySelector("flow-base-prompt-box .submit-controls button.settings-trigger-button");
+      if (!trigger) throw new Error("设置窗口没有对应的关闭入口");
+      trigger.click();
+      await waitForFlowState(() => !settings.isConnected, "设置窗口未关闭");
     }
   }
 
   let isStopRequested = false;
 
   let batchPromise = null;
+  function checkTaskFrames(rowIndex) {
+    if (batchPromise) { showToast("请先停止当前任务，再检查首尾帧"); return; }
+    isStopRequested = false;
+    const task = state.tasks[rowIndex];
+    const lineText = splitTextToLines(task?.text || "")[0];
+    if (!lineText) { showToast("请先填写提示词"); return; }
+    const preset = parsePreset(state.presets.find(p => p.name === task.preset)?.content);
+    const buttons = document.querySelectorAll("#flow-tasks-table button, #btn-start-batch");
+    buttons.forEach(button => button.disabled = true);
+    closePanel();
+    batchPromise = (async () => {
+      resolveTaskImages(task, getLoadedPageImages());
+      await submitTaskToPage({
+        image: task.image, endImage: task.endImage, lineText,
+        presetBefore: preset.before, presetAfter: preset.after,
+        footageType: task.footageType, count: task.count,
+        duration: normalizeDuration(task.duration, calculateDuration(lineText)),
+        rowIndex, lineIndex: 0, resolution: task.resolution,
+        aspectRatio: task.aspectRatio, videoModel: task.videoModel,
+        checkOnly: true
+      });
+      showToast(`任务 #${rowIndex + 1} 首尾帧检查通过，未点击生成`, 8000);
+    })().catch(error => {
+      console.error("[FlowUI] 首尾帧检查失败:", error);
+      showToast(`检查失败：${error.message}`, 10000);
+    }).finally(() => {
+      buttons.forEach(button => button.disabled = false);
+      batchPromise = null;
+    });
+    return batchPromise;
+  }
+
   function startBatch(singleRowIndex = null) {
     if (batchPromise) return batchPromise;
     isStopRequested = false;
@@ -2547,6 +2629,11 @@
     const isSingle = singleRowIndex !== null && typeof singleRowIndex === "number";
     showToast(isSingle ? `🎬 [Vids] 开始执行单项任务 #${singleRowIndex + 1}...` : `🎬 [Vids] 开始逐个任务生成队列 (共 ${state.tasks.length} 项)...`, 4000);
 
+    const selectedTasks = isSingle ? [state.tasks[singleRowIndex]] : state.tasks;
+    if (selectedTasks.some(task => task?.endImage)) {
+      throw new Error("当前 Vids 自动化尚未支持尾帧，请将首尾帧任务分配到 Flow 浏览器执行");
+    }
+
     // 1. 打开右侧 AI 视频片段侧边栏并切换到“添加动画”
     await ensureVidsSidebarAndAnimateTab();
 
@@ -2961,6 +3048,7 @@
             
             await submitTaskToPage({
               image: task.image,
+              endImage: task.endImage,
               lineText: lineText,
               presetBefore: parsedPreset.before,
               presetAfter: parsedPreset.after,
@@ -3033,7 +3121,8 @@
             break;
           }
           // 1. 检查该任务行是否已经完成下载 (status 变为 success 或 downloaded[lIdx] 变为 true)
-          if (task.status[lIdx] === "success" && (Array.isArray(task.downloaded) && task.downloaded[lIdx])) {
+          if (task.downloaded?.[lIdx] === true) {
+            if (task.status[lIdx] !== "success") updateLineStatus(rIdx, lIdx, "success", "视频下载已完成");
             isTaskCompleted = true;
             console.log(`[Batch] 任务已确认生成并下载成功！(Row=${rIdx}, Line=${lIdx}, 耗时=${Math.round(waitedSec)}s)`);
             break;
@@ -3115,7 +3204,8 @@
           waitedSec = (Date.now() - waitStartTime) / 1000;
 
           // 4. 下载完成严格校验
-          if (task.status[lIdx] === "success" && (Array.isArray(task.downloaded) && task.downloaded[lIdx])) {
+          if (task.downloaded?.[lIdx] === true) {
+            if (task.status[lIdx] !== "success") updateLineStatus(rIdx, lIdx, "success", "视频下载已完成");
             isTaskCompleted = true;
             break;
           }
@@ -3331,7 +3421,7 @@
     const targetDisplayName = MODEL_DISPLAY_NAMES[targetModelId] || targetModelId;
     console.log(`[FlowUI] 🔄 面板内模型切换: 目标="${targetDisplayName}" (ID=${targetModelId})`);
 
-    const modelBtnSelector = 'button[aria-label="选择模型系列"], button[aria-label="選取模型系列"], button[aria-label*="模型"], button[aria-label*="model" i], button.mat-mdc-menu-trigger';
+    const modelBtnSelector = 'button[aria-label="选择模型系列"], button[aria-label="選取模型系列"], button[aria-label*="模型"], button[aria-label*="model" i]';
 
     // 1. 在设置面板内查找模型选择器按钮
     let triggerBtn = overlay.querySelector(modelBtnSelector);
@@ -3340,16 +3430,6 @@
       const triggerContent = overlay.querySelector('.model-select-trigger-content');
       triggerBtn = triggerContent?.closest('button');
       if (triggerBtn) console.log("[FlowUI] 通过 .model-select-trigger-content 回退找到模型按钮");
-    }
-    if (!triggerBtn) {
-      // 回退: 在整个页面中查找 (可能在 overlay 外层)
-      triggerBtn = document.querySelector('flow-prompt-box-settings ' + modelBtnSelector) ||
-                   document.querySelector('button[aria-label="选择模型系列"], button[aria-label="選取模型系列"], button[aria-label*="model family" i]');
-      if (!triggerBtn) {
-        const triggerContent = document.querySelector('.model-select-trigger-content');
-        triggerBtn = triggerContent?.closest('button');
-      }
-      if (triggerBtn) console.log("[FlowUI] 在页面全局找到模型按钮");
     }
 
     if (!triggerBtn) {
@@ -3372,15 +3452,21 @@
     console.log(`[FlowUI] ⚠️ 当前模型 "${currentModelText}" ≠ 目标 "${targetDisplayName}"，正在自动切换...`);
 
     // 4. 点击触发按钮打开下拉菜单
-    console.log("[FlowUI] 点击模型选择器按钮...");
+    const oldPanes = new Set(document.querySelectorAll(".cdk-overlay-pane"));
     triggerBtn.click();
-    await delay(800);
+    const menuRoot = await waitForFlowState(() => {
+      const controlled = triggerBtn.getAttribute("aria-controls");
+      const byId = controlled ? document.getElementById(controlled) : null;
+      if (byId && !overlay.contains(byId)) return byId;
+      return Array.from(document.querySelectorAll(".cdk-overlay-pane"))
+        .find(pane => !oldPanes.has(pane) && pane.querySelector("[role='menu'], [role='menuitem']"));
+    }, "模型选择菜单未打开，未点击其他控件");
 
     // 5. 在下拉菜单中查找目标模型选项
     let targetMenuItem = null;
 
     // 策略 A: 查找 span.label 文本
-    const labelElements = document.querySelectorAll('.cdk-overlay-container span.label, .cdk-overlay-container .item-text .label, .cdk-overlay-container [role="menuitem"] span');
+    const labelElements = menuRoot.querySelectorAll('span.label, .item-text .label, [role="menuitem"] span');
     console.log(`[FlowUI] 下拉菜单中找到 ${labelElements.length} 个 label 元素`);
     for (const label of labelElements) {
       const labelText = (label.textContent || "").trim();
@@ -3394,7 +3480,7 @@
 
     // 策略 B: 遍历菜单按钮
     if (!targetMenuItem) {
-      const allMenuBtns = document.querySelectorAll('.cdk-overlay-container button, .cdk-overlay-container [role="menuitem"]');
+      const allMenuBtns = menuRoot.querySelectorAll('button, [role="menuitem"]');
       for (const btn of allMenuBtns) {
         const btnText = (btn.textContent || "").trim();
         if (isModelNameMatch(btnText, targetDisplayName, targetModelId)) {
@@ -3428,27 +3514,8 @@
 
     console.log(`[FlowUI] 开始同步视频设置: 模式=${targetFootage}, 比例=${targetAspect}, 分辨率=${targetRes}, 数量=${targetCount}, 时长=${duration || '默认'}, 模型=${videoModel || '默认'}`);
 
-    // 0-B. 尝试全局 store 兜底设置
-    try {
-      if (window.promptBoxStore && typeof window.promptBoxStore.setState === "function") {
-        window.promptBoxStore.setState({
-          videoResolution: targetRes,
-          selectedVideoResolution: targetRes,
-          resolution: targetRes,
-          aspectRatio: targetAspect === "ASPECT_RATIO_9_16" ? "PORTRAIT" : (targetAspect === "ASPECT_RATIO_1_1" ? "SQUARE" : "LANDSCAPE"),
-          outputsPerPrompt: targetCount,
-          videoModelFamilyId: videoModel || "omni_1_1_flash",
-          mode: targetFootage
-        });
-      }
-    } catch (storeErr) {
-      console.warn("[FlowUI] promptBoxStore 兜底更新提示:", storeErr);
-    }
-
     const findSettingsTriggerBtn = () =>
-      document.querySelector("button.settings-trigger-button") ||
-      document.querySelector("div.submit-controls button:not(.generate-icon-button)") ||
-      document.querySelector("button[aria-label*='设置'], button[aria-label*='設定'], button[aria-label*='Settings' i]");
+      document.querySelector("flow-base-prompt-box .submit-controls button.settings-trigger-button");
 
     // 1. 定位页面底部的设置按钮 (模型切换后页面可能重新渲染，需要重试)
     let settingsBtn = null;
@@ -3673,7 +3740,174 @@
   // ----------------------------------------------------
   // 自动化关联素材原料：首帧注入 (帧模式) 或素材模式
   // ----------------------------------------------------
-  async function attachImageToPage(image, footageType) {
+  function getFrameTrigger(ingredientBar, frameRole = "first") {
+    if (!ingredientBar) return null;
+    const realSlots = ingredientBar.querySelectorAll(".ingredient-bar-container > .frame-trigger");
+    if (realSlots.length === 2) return realSlots[frameRole === "last" ? 1 : 0];
+    const triggers = Array.from(ingredientBar.querySelectorAll(".frame-trigger"))
+      .filter(el => !el.parentElement?.closest?.(".frame-trigger"));
+    const pattern = frameRole === "last"
+      ? /结束|結束|尾帧|尾幀|末帧|末幀|結束影格|最后|最後|\b(?:end|last)\b/i
+      : /开始|開始|首帧|首幀|初始影格|\b(?:start|first)\b/i;
+    const labelled = triggers.find(el => pattern.test([
+      el.getAttribute("aria-label"), el.getAttribute("title"),
+      el.querySelector("button")?.getAttribute("aria-label")
+    ].filter(label => label && !/\.(?:png|jpe?g|webp|gif)\b/i.test(label)).join(" "))) || triggers.find(el => {
+      const label = String(el.textContent || "").trim();
+      return !/\.(?:png|jpe?g|webp|gif)\b/i.test(label) && pattern.test(label);
+    });
+    return labelled || (frameRole === "last" ? (triggers.length >= 2 ? triggers[1] : null) : triggers[0]) || null;
+  }
+
+  function matchesFrameIdentity(image, candidate) {
+    if (!image || !candidate) return false;
+    const expected = image.primaryMediaKey || image.id || flowImageMediaId(image.src);
+    const actual = candidate.primaryMediaKey || candidate.imageId || candidate.mediaId || candidate.id || flowImageMediaId(candidate.src);
+    if (expected && actual) return expected === actual;
+    if (image.src && candidate.src && flowImageSource(image.src) === flowImageSource(candidate.src)) return true;
+    const wantedName = cleanCompactName(image.displayName || "");
+    const actualName = cleanCompactName(candidate.displayName || candidate.name || "");
+    return !!wantedName && wantedName === actualName;
+  }
+
+  function isRemoveMediaButton(button) {
+    const label = [button.textContent, button.getAttribute("aria-label"), button.getAttribute("title")].filter(Boolean).join(" ");
+    return /移除|删除|刪除|清除|清空|remove|delete|clear|close|\bcancel\b|关闭|關閉/i.test(label);
+  }
+
+  function getFramePickerButton(slot) {
+    if (!slot) return null;
+    return slot.querySelector("button.empty-chip") ||
+      Array.from(slot.querySelectorAll("button")).find(button => !button.disabled && !isRemoveMediaButton(button)) || null;
+  }
+
+  function findMediaConfirmButton(panel) {
+    if (!panel?.isConnected) return null;
+    return Array.from(panel.querySelectorAll("button")).find(button => {
+      if (button.disabled || button.getAttribute("aria-disabled") === "true" || isRemoveMediaButton(button)) return false;
+      const label = (button.textContent || button.getAttribute("aria-label") || "").trim();
+      return /^(确认|确定|確認|確定|选择|選取|選擇|添加|新增|完成|使用|插入|Confirm|Select|Add|Done|OK|Apply|Insert)$/i.test(label);
+    }) || null;
+  }
+
+  function flowImageSource(value) {
+    try {
+      const url = new URL(value, location.href);
+      if (/googleusercontent\.com$/.test(url.hostname)) return url.origin + url.pathname.replace(/=w\d+.*$/, "");
+      return url.href;
+    } catch (_) { return String(value || ""); }
+  }
+
+  function flowImageMediaId(value) {
+    try {
+      const url = new URL(value, location.href);
+      if (url.hostname !== "flow-content.google") return "";
+      // The grid uses opaque /asb/ thumbnails; mounted chips use a signed CDN
+      // /image/<media-id> URL. Its ID matches the grid's data-media-id.
+      return /^\/image\/([a-zA-Z0-9_-]+)\/?$/.exec(url.pathname)?.[1] || "";
+    } catch (_) { return ""; }
+  }
+
+  function exactFlowImageName(value) {
+    return String(value || "").normalize("NFKC").trim().toLowerCase();
+  }
+
+  function findFlowPickerAsset(panel, image) {
+    const options = Array.from(panel.querySelectorAll("flow-add-menu-asset-list button.asset-item[role='option']"));
+    const expectedId = image.primaryMediaKey || image.id;
+    const expectedSource = image.src ? flowImageSource(image.src) : "";
+    const byIdentity = options.filter(option => {
+      const img = option.querySelector("img.asset-thumbnail-image");
+      const id = img?.getAttribute("data-media-id") || option.getAttribute("data-media-id");
+      return (expectedId && id && expectedId === id) ||
+        (expectedSource && img?.src && expectedSource === flowImageSource(img.src));
+    });
+    if (byIdentity.length === 1) return byIdentity[0];
+    const byName = options.filter(option => exactFlowImageName(option.querySelector(".asset-title")?.textContent) ===
+      exactFlowImageName(image.displayName));
+    if (byName.length > 1 || byIdentity.length > 1) throw new Error(`图片 [${image.displayName}] 存在重名素材，无法唯一确认`);
+    return byName[0] || null;
+  }
+
+  async function waitForFlowState(check, message, attempts = 40) {
+    for (let i = 0; i < attempts; i++) {
+      if (isStopRequested) throw new Error("用户已停止任务");
+      const value = check();
+      if (value) return value;
+      await delay(150);
+    }
+    throw new Error(message);
+  }
+
+  async function attachImageToPage(image, footageType, frameRole = "first") {
+    if (!image) return;
+    if (footageType !== "VIDEO_FRAMES") return attachReferenceImageToPage(image, footageType, frameRole);
+    const roleName = frameRole === "last" ? "尾帧" : "首帧";
+    const getBar = () => document.querySelector("flow-base-prompt-box flow-ingredient-bar.prompt-ingredient-bar");
+    const getSlot = () => getFrameTrigger(getBar(), frameRole);
+    if (!getSlot()) throw new Error(`未找到 ${roleName} 固定槽位，请确认 Flow 已切换到帧模式`);
+    if (verifyImageAttached(image, footageType, frameRole)) return;
+
+    // A selected asset in this popover is only a preview. Never reuse a stale picker.
+    const oldPicker = document.querySelector(".cdk-overlay-pane flow-add-menu-popover-content");
+    if (oldPicker) {
+      const close = oldPicker.querySelector("button.header-close-btn");
+      if (!close) throw new Error("无法关闭上一次图片选择窗口");
+      close.click();
+      await waitForFlowState(() => !oldPicker.isConnected, "上一次图片窗口未关闭");
+    }
+    let slot = getSlot();
+    // Live Flow uses the populated chip button to REMOVE the frame. The outer
+    // frame-trigger has no picker action; only the empty-chip opens the picker.
+    if (!slot.querySelector("button.empty-chip")) {
+      const remove = Array.from(slot.querySelectorAll("button")).find(isRemoveMediaButton);
+      if (!remove) throw new Error(`${roleName}旧图片无法安全移除，未点击其他控件`);
+      remove.click();
+      await waitForFlowState(() => getSlot()?.querySelector("button.empty-chip"), `${roleName}旧图片未清除`);
+      slot = getSlot();
+    }
+    slot.querySelector("button.empty-chip").click();
+    const picker = await waitForFlowState(
+      () => document.querySelector(".cdk-overlay-pane flow-add-menu-popover-content"),
+      `${roleName} 图片选择窗口未打开`);
+    let option = findFlowPickerAsset(picker, image);
+    if (!option) {
+      const search = picker.querySelector("input.search-input");
+      if (!search) throw new Error(`图片列表中未找到 [${image.displayName}]`);
+      const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set;
+      if (setter) setter.call(search, image.displayName || "");
+      else search.value = image.displayName || "";
+      search.dispatchEvent(new Event("input", { bubbles: true }));
+      option = await waitForFlowState(() => findFlowPickerAsset(picker, image),
+        `未找到唯一匹配的${roleName}图片 [${image.displayName}]，未选择其他图片`);
+    }
+    option.click();
+    await waitForFlowState(() => option.isConnected && option.getAttribute("aria-selected") === "true",
+      `${roleName}图片没有成为当前选中的素材`);
+    const selectedSource = option.querySelector("img.asset-thumbnail-image")?.src;
+    const add = await waitForFlowState(() => {
+      const preview = picker.querySelector("flow-add-menu-detail-pane img.detail-preview-image");
+      const button = picker.querySelector("flow-add-menu-detail-pane button.detail-add-to-prompt-btn");
+      return preview?.src && selectedSource && flowImageSource(preview.src) === flowImageSource(selectedSource) &&
+        button && !button.disabled && button.getAttribute("aria-disabled") !== "true" ? button : null;
+    }, `${roleName}图片预览未就绪，未点击添加`);
+    add.click();
+    await waitForFlowState(() => !picker.isConnected, `${roleName}图片窗口未完成“添加到提示”`);
+    await waitForFlowState(() => verifyImageAttached(image, footageType, frameRole),
+      `${roleName}图片 [${image.displayName}] 添加后未出现在对应槽位`);
+  }
+
+  async function clearUnusedFlowEndFrame() {
+    const getSlot = () => getFrameTrigger(document.querySelector("flow-base-prompt-box flow-ingredient-bar.prompt-ingredient-bar"), "last");
+    const slot = getSlot();
+    if (!slot || slot.querySelector("button.empty-chip")) return;
+    const remove = Array.from(slot.querySelectorAll("button")).find(isRemoveMediaButton);
+    if (!remove) throw new Error("当前任务没有尾帧，但结束槽位仍有旧图片且无法安全移除，请先手动清除尾帧");
+    remove.click();
+    await waitForFlowState(() => getSlot()?.querySelector("button.empty-chip"), "上一任务的尾帧未能清除");
+  }
+
+  async function attachReferenceImageToPage(image, footageType, frameRole = "first") {
     if (!image) return;
     const imgName = image.displayName || "";
     const imgSrc = image.src || "";
@@ -3682,19 +3916,22 @@
 
     console.log(`[FlowUI] 正在关联素材: Name="${imgName}", Key="${imgKey}", Mode="${footageType}"`);
 
+    if (verifyImageAttached(image, footageType, frameRole)) return;
+
     // 0. 尝试全局 store 注入兜底 (兼容 Flow 早先架构)
     try {
-      if (window.promptBoxStore && typeof window.promptBoxStore.getState === "function") {
+      if (!document.querySelector("flow-ingredient-bar.prompt-ingredient-bar, .prompt-ingredient-bar, flow-ingredient-bar") &&
+          window.promptBoxStore && typeof window.promptBoxStore.getState === "function") {
         const store = window.promptBoxStore.getState();
         if (store.actions && typeof store.actions.addImageIngredient === "function") {
           console.log("[FlowUI] 通过 promptBoxStore.addImageIngredient 注入素材原料");
           store.actions.addImageIngredient({
             imageId: imgKey || imgName,
-            preferredIngredientType: isFrameMode ? "FIRST_FRAME" : "REFERENCE",
+            preferredIngredientType: isFrameMode ? (frameRole === "last" ? "LAST_FRAME" : "FIRST_FRAME") : "REFERENCE",
             source: "PLUS_BUTTON"
           });
           await delay(300);
-          return;
+          if (verifyImageAttached(image, footageType, frameRole)) return;
         }
       }
     } catch (storeErr) {
@@ -3704,19 +3941,29 @@
     // 1. 核心通道：通过 flow-ingredient-bar 的“开始”帧槽位注入 (帧模式)
     const ingredientBar = document.querySelector("flow-ingredient-bar.prompt-ingredient-bar, .prompt-ingredient-bar, flow-ingredient-bar");
     if (ingredientBar) {
-      const startTrigger = ingredientBar.querySelector(".frame-trigger:first-of-type, .frame-trigger");
+      let startTrigger = getFrameTrigger(ingredientBar, frameRole);
       if (startTrigger) {
         // 如果首帧已有内容且匹配当前图片，无需重复添加
         const triggerImg = startTrigger.querySelector("img");
         const triggerTitle = extractTileDisplayName(startTrigger, triggerImg);
         const triggerText = startTrigger.textContent || "";
-        if (imgName && (isImageNameMatch(imgName, triggerTitle) || isImageNameMatch(imgName, triggerText))) {
+        if (verifyImageAttached(image, footageType, frameRole)) {
           console.log("[FlowUI] 首帧槽位中已存在匹配图片，无需重复注入:", imgName);
           return;
         }
 
         // 点击“开始”按钮（button.empty-chip 或 button）打开媒体选择面板
-        const startBtn = startTrigger.querySelector("button.empty-chip") || startTrigger.querySelector("button");
+        let startBtn = getFramePickerButton(startTrigger);
+        if (!startBtn) {
+          const remove = Array.from(startTrigger.querySelectorAll("button")).find(isRemoveMediaButton);
+          if (remove) {
+            simulateClick(remove);
+            await delay(300);
+            const freshBar = document.querySelector("flow-ingredient-bar.prompt-ingredient-bar, .prompt-ingredient-bar, flow-ingredient-bar");
+            startTrigger = getFrameTrigger(freshBar, frameRole);
+            startBtn = getFramePickerButton(startTrigger);
+          }
+        }
         if (startBtn) {
           console.log("[FlowUI] 点击首帧触发器按钮 [开始] 弹出媒体选择面板...");
           simulateClick(startBtn);
@@ -3755,11 +4002,14 @@
               const itemText = item.textContent || "";
               const itemId = itemImg?.dataset?.mediaId || item.dataset?.mediaId || item.dataset?.tileId || "";
 
-              if (imgKey && itemId && (imgKey === itemId || itemId.includes(imgKey) || imgKey.includes(itemId))) {
-                matchedCard = item;
-                break;
+              if (imgKey && itemId) {
+                if (imgKey === itemId) {
+                  matchedCard = item;
+                  break;
+                }
+                continue;
               }
-              if (imgName && (isImageNameMatch(imgName, itemDisplayName) || isImageNameMatch(imgName, itemTitle) || isImageNameMatch(imgName, itemAlt) || isImageNameMatch(imgName, itemAria) || isImageNameMatch(imgName, itemText))) {
+              if (imgName && (isStrictImageMatch(imgName, itemDisplayName) || isStrictImageMatch(imgName, itemTitle) || isStrictImageMatch(imgName, itemAlt) || isStrictImageMatch(imgName, itemAria) || isStrictImageMatch(imgName, itemText))) {
                 matchedCard = item;
                 break;
               }
@@ -3770,19 +4020,10 @@
               const allImgTiles = Array.from(overlayPanel.querySelectorAll("flow-grid-tile-container, flow-image-tile, button:has(img), div:has(> img)"));
               for (const tile of allImgTiles) {
                 const tName = extractTileDisplayName(tile, tile.querySelector("img"));
-                if (imgName && tName && isImageNameMatch(imgName, tName)) {
+                if (imgName && tName && isStrictImageMatch(imgName, tName)) {
                   matchedCard = tile;
                   break;
                 }
-              }
-            }
-
-            // 如果仍未匹配，且弹窗中只有少量图片，兜底选取第一张图片素材
-            if (!matchedCard && candidateItems.length > 0) {
-              const firstTile = overlayPanel.querySelector("flow-grid-tile-container:has(img), flow-image-tile, button:has(img)");
-              if (firstTile && candidateItems.length <= 2) {
-                console.log("[FlowUI] 弹窗中候选较少，选用第一张素材:", firstTile);
-                matchedCard = firstTile;
               }
             }
 
@@ -3793,29 +4034,15 @@
 
               await delay(400);
 
-              // 关键！自动检测并点击弹层中的“确认”、“确定”、“选择”、“添加”、“完成”按钮（彻底解放用户手动点击！）
-              const allButtons = Array.from(document.querySelectorAll(
-                ".cdk-overlay-container button, mat-dialog-actions button, .mat-mdc-dialog-actions button, .cdk-overlay-pane button"
-              )).filter(btn => {
-                if (btn.disabled || btn.getAttribute("aria-disabled") === "true") return false;
-                const t = (btn.textContent || "").trim();
-                const aria = (btn.getAttribute("aria-label") || "").trim();
-                if (/^(取消|关闭|關閉|Cancel|Close|Dismiss)$/i.test(t) || /^(取消|关闭|關閉|Cancel|Close|Dismiss)$/i.test(aria)) return false;
-                if (/(确认|确定|確認|確定|选择|選取|選擇|添加|新增|完成|使用|插入|首帧|初始影格|Confirm|Select|Add|Done|OK|Apply|Insert)/i.test(t) ||
-                    /(确认|确定|確認|確定|选择|選取|選擇|添加|新增|完成|使用|插入|首帧|初始影格|Confirm|Select|Add|Done|OK|Apply|Insert)/i.test(aria)) return true;
-                if (btn.closest("mat-dialog-actions, .mat-mdc-dialog-actions") && (btn.classList.contains("primary") || btn.classList.contains("flow-button-primary") || btn.classList.contains("mat-mdc-unelevated-button") || btn.classList.contains("mat-primary"))) return true;
-                return false;
-              });
-
-              if (allButtons.length > 0) {
-                const actionBtn = allButtons.find(b => /(确认|确定|確認|確定|选择|選取|選擇|添加|新增|完成|使用|首帧|初始影格|Confirm|Select|Add|Done|OK|Apply)/i.test((b.textContent || "") + (b.getAttribute("aria-label") || ""))) || allButtons[allButtons.length - 1];
-                console.log(`[FlowUI] 🎯 自动点击媒体选择弹窗确认按钮: "${(actionBtn.textContent || actionBtn.getAttribute('aria-label') || '').trim()}"`);
+              // Only confirm inside this picker; never click a frame's remove button.
+              const actionBtn = findMediaConfirmButton(overlayPanel);
+              if (actionBtn) {
                 simulateClick(actionBtn);
                 await delay(500);
               }
 
               await delay(300);
-              if (verifyImageAttached(image, footageType)) {
+              if (verifyImageAttached(image, footageType, frameRole)) {
                 console.log("[FlowUI] ✅ 首帧素材挂载成功！");
                 return;
               }
@@ -3832,6 +4059,10 @@
       }
     }
 
+    if (frameRole === "last") {
+      throw new Error(`尾帧 [${imgName}] 未能挂载到结束帧槽位，请确认使用帧模式且素材已上传`);
+    }
+
     // 2. 备选通道：输入框左下角加号菜单 (flow-add-menu)
     const addMenuBtn = document.querySelector("flow-add-menu button.add-menu-trigger, flow-add-menu button, button.add-menu-trigger, button.add-ingredient-button");
     if (addMenuBtn) {
@@ -3845,7 +4076,7 @@
         let clickedOpt = false;
         for (const opt of options) {
           const optText = opt.textContent || "";
-          if (imgName && isImageNameMatch(imgName, optText)) {
+          if (imgName && isStrictImageMatch(imgName, optText)) {
             console.log(`[FlowUI] 在素材菜单中找到匹配素材: ${optText.trim()}，点击添加`);
             simulateClick(opt);
             clickedOpt = true;
@@ -3898,12 +4129,37 @@
   }
 
   // 校验当前页面输入区域是否已成功挂载所要求的素材图片
-  function verifyImageAttached(image, footageType) {
-    if (!image || (!image.displayName && !image.src && !image.primaryMediaKey)) {
+  function verifyImageAttached(image, footageType, frameRole = "first") {
+    if (!image || (!image.displayName && !image.src && !image.primaryMediaKey && !image.id)) {
       return true; // 未指定图片（纯文本生成任务），直接放行
     }
 
     const isFrameMode = footageType === "VIDEO_FRAMES";
+
+    if (isFrameMode) {
+      const role = frameRole === "last" ? "LAST_FRAME" : "FIRST_FRAME";
+      let store = null;
+      try { store = window.promptBoxStore?.getState?.(); } catch (_) {}
+      const frame = frameRole === "last"
+        ? (store?.endFrame || store?.lastFrame || store?.frames?.end || store?.frames?.last)
+        : (store?.startFrame || store?.firstFrame || store?.frames?.start || store?.frames?.first);
+      const bar = document.querySelector("flow-ingredient-bar.prompt-ingredient-bar, .prompt-ingredient-bar, flow-ingredient-bar");
+      const slot = getFrameTrigger(bar, frameRole);
+      if (slot) {
+        if (slot.querySelector("button.empty-chip")) return false;
+        const img = slot.querySelector("img");
+        const candidate = { src: img?.currentSrc || img?.src || "",
+          displayName: extractTileDisplayName(slot, img),
+          id: img?.getAttribute?.("data-media-id") || slot.getAttribute?.("data-media-id") || "" };
+        return matchesFrameIdentity(image, candidate);
+      }
+      // A visible frame bar with no matching slot cannot be confirmed by a stale store.
+      if (bar) return false;
+      if (matchesFrameIdentity(image, frame)) return true;
+      const ingredients = store?.ingredients || store?.imageIngredients || [];
+      return Array.isArray(ingredients) && ingredients.some(value =>
+        (value.preferredIngredientType || value.ingredientType || value.type) === role && matchesFrameIdentity(image, value));
+    }
 
     // 1. 优先检查 flow.promptBoxStore 全局状态（如可用）
     try {
@@ -3970,51 +4226,43 @@
     return false;
   }
 
-  // 注入提示词至 ProseMirror 并触发 Angular 提交
-  async function submitTaskToPage(params) {
-    const { image, lineText, presetBefore, presetAfter, footageType, count, duration, rowIndex, lineIndex, resolution, aspectRatio, videoModel } = params;
-    
-    // 0. 同步视频尺寸比例、分辨率、视频类型(帧/素材)、输出数量与生成模型
-    const targetRes = resolution || state.settings.resolution || "VIDEO_RESOLUTION_720P";
-    const targetAspect = aspectRatio || state.settings.aspectRatio || "ASPECT_RATIO_9_16";
-    const targetModel = (videoModel && videoModel !== "VIDEO_REFERENCES" ? videoModel : null) || state.settings.videoModel || "omni_1_1_flash";
-    const targetFootage = footageType || state.settings.footageType || "VIDEO_FRAMES";
-    const targetCount = count || state.settings.defaultCount || 1;
+  function getFlowEditor() {
+    return document.querySelector("flow-base-prompt-box flow-rich-text-editor div.ProseMirror[contenteditable='true']");
+  }
 
-    // 关键修复 1：先同步页面设置（切换到目标模式如“帧”模式），确保 flow-ingredient-bar 显示出首帧槽位，且设置切换不会清除刚挂载的图片！
-    try {
-      await syncPageVideoSettings({
-        resolution: targetRes,
-        aspectRatio: targetAspect,
-        videoModel: targetModel,
-        footageType: targetFootage,
-        count: targetCount,
-        duration: duration
-      });
-    } catch (settErr) {
-      throw settErr;
+  function verifyFlowPrompt(expected) {
+    const editor = getFlowEditor();
+    if (!editor || !String(expected || "").trim()) return false;
+    const normalize = text => String(text || "").replace(/\s+/g, " ").trim();
+    const view = editor.pmViewDesc?.view;
+    const actual = typeof view?.state?.doc?.textBetween === "function"
+      ? view.state.doc.textBetween(0, view.state.doc.content.size, "\n")
+      : (editor.innerText || editor.textContent || "");
+    return normalize(actual) === normalize(expected);
+  }
+
+  function assertFlowTaskReady(params, footageType) {
+    if (!verifyFlowPrompt(params.finalPrompt)) throw new Error("提示词为空、被清空或与本次任务不一致，已取消提交");
+    if (params.image && !verifyImageAttached(params.image, footageType, "first")) {
+      throw new Error(`首帧 [${params.image.displayName || "图片"}] 与任务不一致或未挂载，已取消提交`);
     }
-
-    // 提交前清理历史弹窗与遮罩，确保输入框与按钮处于可交互视口
-    await cleanupPageOverlays();
-
-    // 关键修复 2：在目标模式设置好后，再挂载参考图片/首帧素材原料！
-    if (image && (image.displayName || image.src || image.primaryMediaKey)) {
-      try {
-        await attachImageToPage(image, targetFootage);
-      } catch (imgErr) {
-        console.warn("[FlowUI] 注入图片原料异常 (继续执行):", imgErr);
-      }
+    if (params.endImage && !verifyImageAttached(params.endImage, footageType, "last")) {
+      throw new Error(`尾帧 [${params.endImage.displayName || "图片"}] 与任务不一致或未挂载，已取消提交`);
     }
+    if (!params.endImage && footageType === "VIDEO_FRAMES") {
+      const last = getFrameTrigger(document.querySelector("flow-base-prompt-box flow-ingredient-bar.prompt-ingredient-bar"), "last");
+      if (last && !last.querySelector("button.empty-chip")) throw new Error("当前任务没有尾帧，页面仍残留旧尾帧，已取消提交");
+    }
+  }
 
+  async function writeFlowPrompt(finalPrompt) {
+    if (!finalPrompt.trim()) throw new Error("本次任务没有提示词，已取消提交");
     // 3. 定位 ProseMirror 输入框
-    let editor = document.querySelector("flow-rich-text-editor div.ProseMirror") || 
-                 document.querySelector("div.ProseMirror[contenteditable='true']");
+    let editor = getFlowEditor();
     if (!editor) {
       for (let i = 0; i < 10; i++) {
         await delay(300);
-        editor = document.querySelector("flow-rich-text-editor div.ProseMirror") || 
-                 document.querySelector("div.ProseMirror[contenteditable='true']");
+        editor = getFlowEditor();
         if (editor) break;
       }
     }
@@ -4022,13 +4270,6 @@
     if (!editor) {
       throw new Error("页面上未找到提示词输入框 (flow-rich-text-editor ProseMirror)");
     }
-
-    // 4. 拼装拼接后的提示词
-    const finalPrompt = `${presetBefore || ""}
-${lineText || ""}
-${presetAfter || ""}`.trim();
-    params.finalPrompt = finalPrompt;
-    console.log(`[FlowUI] 正在填入提示词 (第 ${rowIndex + 1} 个任务, 子行 ${lineIndex + 1}): "${finalPrompt.substring(0, 60)}..."`);
 
     // 5. 注入文本到 ProseMirror 编辑器 (支持多行段落，绝不让 ProseMirror 报错)
     try {
@@ -4072,7 +4313,7 @@ ${presetAfter || ""}`.trim();
     }
 
     // 策略 C: 结构化段落替换
-    if (!textInjected || editor.textContent.trim() !== finalPrompt) {
+    if (!textInjected || !verifyFlowPrompt(finalPrompt)) {
       if (typeof editor.replaceChildren === "function") {
         const paragraphs = finalPrompt.split("\n").map(l => {
           const p = document.createElement("p");
@@ -4097,8 +4338,64 @@ ${presetAfter || ""}`.trim();
     editor.dispatchEvent(new InputEvent("input", { bubbles: true, cancelable: true, inputType: "insertFromPaste", data: finalPrompt }));
     editor.dispatchEvent(new Event("input", { bubbles: true }));
     editor.dispatchEvent(new Event("change", { bubbles: true }));
-    window.promptBoxStore?.getState?.().actions?.setText?.(finalPrompt);
-    window.promptBoxStore?.getState?.().actions?.setPrompt?.(finalPrompt);
+    await delay(300);
+    if (!verifyFlowPrompt(finalPrompt)) {
+      throw new Error("提示词未成功写入或被页面重置，已取消提交");
+    }
+
+  }
+
+  // 注入提示词至 ProseMirror 并触发 Angular 提交
+  async function submitTaskToPage(params) {
+    const { image, endImage, lineText, presetBefore, presetAfter, footageType, count, duration, rowIndex, lineIndex, resolution, aspectRatio, videoModel } = params;
+
+    // 0. 同步视频尺寸比例、分辨率、视频类型(帧/素材)、输出数量与生成模型
+    const targetRes = resolution || state.settings.resolution || "VIDEO_RESOLUTION_720P";
+    const targetAspect = aspectRatio || state.settings.aspectRatio || "ASPECT_RATIO_9_16";
+    const targetModel = (videoModel && videoModel !== "VIDEO_REFERENCES" ? videoModel : null) || state.settings.videoModel || "omni_1_1_flash";
+    const targetFootage = footageType || state.settings.footageType || "VIDEO_FRAMES";
+    const targetCount = count || state.settings.defaultCount || 1;
+    if (endImage && targetFootage !== "VIDEO_FRAMES") {
+      throw new Error("设置了尾帧的任务必须使用帧模式，不能使用素材模式");
+    }
+
+    await cleanupPageOverlays();
+
+    // 关键修复 1：先同步页面设置（切换到目标模式如“帧”模式），确保 flow-ingredient-bar 显示出首帧槽位，且设置切换不会清除刚挂载的图片！
+    try {
+      await syncPageVideoSettings({
+        resolution: targetRes,
+        aspectRatio: targetAspect,
+        videoModel: targetModel,
+        footageType: targetFootage,
+        count: targetCount,
+        duration: duration
+      });
+    } catch (settErr) {
+      throw settErr;
+    }
+
+    // 提交前清理历史弹窗与遮罩，确保输入框与按钮处于可交互视口
+    await cleanupPageOverlays();
+
+    // Text replacement may clear media chips, so write and verify text first.
+    params.finalPrompt = `${presetBefore || ""}\n${lineText || ""}\n${presetAfter || ""}`.trim();
+    await writeFlowPrompt(params.finalPrompt);
+
+    // 关键修复 2：在目标模式设置好后，再挂载参考图片/首帧素材原料！
+    if (image && (image.displayName || image.src || image.primaryMediaKey)) {
+      try {
+        await attachImageToPage(image, targetFootage);
+      } catch (imgErr) {
+        throw new Error("首帧挂载失败：" + imgErr.message);
+      }
+    }
+
+    if (endImage) {
+      await attachImageToPage(endImage, targetFootage, "last");
+    } else if (targetFootage === "VIDEO_FRAMES") {
+      await clearUnusedFlowEndFrame();
+    }
 
     // 6. 提交前图片挂载状态二次复核与补救
     if (image && (image.displayName || image.src || image.primaryMediaKey)) {
@@ -4117,13 +4414,28 @@ ${presetAfter || ""}`.trim();
       if (isMounted) {
         console.log(`[FlowUI] ✅ 提交前图片挂载校验通过: [${image.displayName || "素材图片"}] 已正确挂载到输入框！`);
       } else {
-        console.warn(`[FlowUI] ⚠️ 挂载检测未直接捕获到芯片，继续执行发送...`);
+        throw new Error(`首帧 [${image.displayName || "图片"}] 未确认挂载，已取消提交`);
       }
     }
 
+    if (endImage && !verifyImageAttached(endImage, targetFootage, "last")) {
+      await attachImageToPage(endImage, targetFootage, "last");
+      await delay(600);
+      if (!verifyImageAttached(endImage, targetFootage, "last")) {
+        throw new Error(`尾帧 [${endImage.displayName || "图片"}] 未确认挂载，已取消本次提交`);
+      }
+    }
+
+    await delay(300);
+    assertFlowTaskReady(params, targetFootage);
+
+    // Diagnostic preparation shares the real submission path but never registers
+    // an active generation, changes task progress, or clicks the generate button.
+    if (params.checkOnly === true) return;
+
     // 7. 查找生成按钮并确保可点击发送
     const findButton = () => document.querySelector(
-      "flow-generate-icon-button button, button.generate-icon-button, button[aria-label*='生成'], button[aria-label*='產生'], button[aria-label*='开始'], button[aria-label*='開始'], button[aria-label*='建立'], button[aria-label*='Generate' i], button[aria-label*='Create' i]"
+      "flow-base-prompt-box .submit-controls flow-generate-icon-button button.generate-icon-button[type='submit']"
     );
     let button;
     for (let i = 0; i < 40; i++) {
@@ -4132,22 +4444,15 @@ ${presetAfter || ""}`.trim();
       if (!state.isSuspended && button && !button.disabled && !button.hasAttribute("disabled") && button.getAttribute("aria-disabled") !== "true") break;
       // 若按钮仍 disabled，尝试重新派发输入事件激活
       if (button && (button.disabled || button.getAttribute("aria-disabled") === "true")) {
-        editor.dispatchEvent(new Event("input", { bubbles: true }));
-        editor.dispatchEvent(new Event("change", { bubbles: true }));
+        const activeEditor = getFlowEditor();
+        activeEditor?.dispatchEvent(new Event("input", { bubbles: true }));
+        activeEditor?.dispatchEvent(new Event("change", { bubbles: true }));
       }
       button = null;
       await delay(500);
     }
     if (!button) {
-      button = findButton();
-      if (button) {
-        console.warn("[FlowUI] ⚠️ 生成按钮超时未就绪，强制解除 disabled 限制触发点击");
-        button.removeAttribute("disabled");
-        button.disabled = false;
-        button.setAttribute("aria-disabled", "false");
-      } else {
-        throw new Error("Flow 生成按钮尚未就绪，请检查页面提示");
-      }
+      throw new Error("Flow 生成按钮尚未就绪，已取消提交；请检查提示词、首尾帧及页面提示");
     }
 
     await sendToExtension("setActiveTask", {
@@ -4173,6 +4478,12 @@ ${presetAfter || ""}`.trim();
     window.currentProcess = params;
     state.activeTasksQueue = [params];
 
+    // Recheck after asynchronous state persistence and DOM re-rendering.
+    assertFlowTaskReady(params, targetFootage);
+    button = findButton();
+    if (!button || button.disabled || button.hasAttribute("disabled") || button.getAttribute("aria-disabled") === "true") {
+      throw new Error("提交前生成按钮变为不可用，已取消提交");
+    }
     console.log("[FlowUI] 🚀 正在触发生成按钮点击发送 (严格单次原生单击):", button);
     simulateClick(button);
     await delay(500);
@@ -4830,6 +5141,9 @@ ${presetAfter || ""}`.trim();
   function updateLineStatus(rowIndex, lineIndex, status, message) {
     const task = state.tasks[rowIndex];
     if (task) {
+      // A fast download may complete while an earlier "started downloading"
+      // request is awaiting its response. Never overwrite confirmed completion.
+      if (task.downloaded?.[lineIndex] === true && status !== "success") return;
       task.status[lineIndex] = status;
       task.message[lineIndex] = message;
       saveState();
@@ -5331,7 +5645,9 @@ ${presetAfter || ""}`.trim();
           await saveState();
         } catch (e) { reply(false, "导入任务失败：" + String(e && e.message || e)); return; }
         if (!count) { reply(false, "没有可导入的任务"); return; }
-        reply(true, "", { count });
+        const frames = getTaskFrameReceipt(state.tasks.slice(-count));
+        console.log("[FlowHosted] 托管任务首尾帧接收回执:", frames);
+        reply(true, "", { count, frames });
         try { showToast(`🤖 托管模式：已接收 ${count} 个任务，开始生成`, 4000); } catch (_) {}
 
         hostedStatusHook = (r, l, status, message) => {

@@ -8,18 +8,19 @@
 步骤 2：按浏览器分组上传图片（默认每组 5 个浏览器），一组全部完成或超时后再进入下一组；
         精确记录每张失败的图片，支持「重新上传失败图片」
 步骤 3：把每批任务 JSON 直接发送给对应插件并自动开始生成，实时监控每个任务成功/失败，
-        视频保存在 Flow 临时下载目录，后续由用户在「批量检查视频」中核对并手动完成归位
+        视频下载完成后，后台自动检查并归位至对应项目 downloads/videos 目录
 """
 import json
 import time
 import shutil
 import logging
+import sys
 from pathlib import Path
 
 from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QSpinBox,
                              QTableWidget, QTableWidgetItem, QHeaderView, QMessageBox,
                              QAbstractItemView, QTextEdit, QGroupBox, QSplitter)
-from PyQt6.QtCore import Qt, QTimer
+from PyQt6.QtCore import Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QColor
 
 logger = logging.getLogger(__name__)
@@ -28,6 +29,8 @@ GREEN, RED, YELLOW, BLUE, GRAY = "#DCFCE7", "#FEE2E2", "#FEF9C3", "#DBEAFE", "#F
 
 
 class HostedModeWidget(QWidget):
+    relocation_finished = pyqtSignal(object)
+
     def __init__(self, plugin_server, main_window, parent=None):
         super().__init__(parent)
         self.plugin_server = plugin_server
@@ -59,6 +62,9 @@ class HostedModeWidget(QWidget):
         self.upload_group_active = False
         self.upload_retry_only = False
         self.running = False         # 步骤 3 是否在运行
+        self._relocation_pool = None
+        self._relocation_jobs = {}
+        self.relocation_finished.connect(self._on_video_relocated)
 
         self._init_ui()
 
@@ -559,13 +565,21 @@ class HostedModeWidget(QWidget):
         return any(c.get("client_id") == client_id for c in self._clients())
 
     def _poll_pending_closes(self):
-        from services import browser_closer as bc
+        bc = None
+        if sys.platform == 'win32':
+            from services import browser_closer as bc
         now = time.time()
         for token, p in list(self._pending_closes.items()):
             try:
                 if not self._client_connected(p["client_id"]):
                     self._log(f"✅ 浏览器已成功关闭: {p['label']}")
                     del self._pending_closes[token]
+                    continue
+
+                if bc is None:
+                    if now - p['start'] > 6:
+                        self._log(f"❌ 插件关闭浏览器超时，请手动关闭: {p['label']}")
+                        del self._pending_closes[token]
                     continue
 
                 if p["hwnds"] is None:
@@ -972,6 +986,16 @@ class HostedModeWidget(QWidget):
             if msg.get("success"):
                 b["run_state"] = "生成中"
                 self._log(f"🚀 {b['short']} 已被 {self._label(b['email'])} 接收（{data.get('count')} 个任务），开始生成")
+                frames = data.get("frames")
+                if isinstance(frames, list):
+                    received = [f.get("last") or "" for f in frames]
+                    expected = [t.get("end_image_name") or "" for t in b["tasks"]]
+                    self._log(f"🎬 插件确认收到尾帧 {sum(bool(n) for n in received)}/{len(received)} 个任务；"
+                              + "；".join(f"#{i + 1} {name or '未设置'}" for i, name in enumerate(received)))
+                    if received != expected:
+                        self._log("❌ 首尾帧回执不一致，请停止本批并检查插件版本及任务分配记录")
+                else:
+                    self._log("⚠️ 当前插件未提供首尾帧接收回执，无法核对实际接收内容")
             else:
                 b["run_state"] = "发送失败"
                 self._log(f"❌ {b['short']} 发送失败：{msg.get('error')}")
@@ -1043,6 +1067,9 @@ class HostedModeWidget(QWidget):
             self.refresh_all()
             return
         nxt["run_state"] = "已发送"
+        end_names = [t.get("end_image_name") or "" for t in nxt["tasks"]]
+        self._log(f"🎬 {nxt['short']} 发送前尾帧：{sum(bool(n) for n in end_names)}/{len(end_names)} 个任务；"
+                  + "；".join(f"#{i + 1} {name or '未设置'}" for i, name in enumerate(end_names)))
         req = self.plugin_server.send_rpc_action(c["client_id"], "run_tasks",
                                                  {"batch_id": nxt["id"], "tasks": nxt["tasks"], "clear_existing": True})
         if not req:
@@ -1088,7 +1115,66 @@ class HostedModeWidget(QWidget):
         b["fail_msgs"].pop(dl_path, None)
         b["ok"] = len(b["done_paths"])
         name = Path(dl_path).name
-        self._log(f"   🎬 视频已下载: {name}（保留在 Flow 目录，待后续批量检查归位）")
+        self._log(f"   🎬 视频已下载: {name}，正在自动检查归位…")
+        self._queue_video_relocation(b, dl_path)
+
+    def _queue_video_relocation(self, batch, download_path):
+        # Use the dispatched task's project destination, not a path supplied by a
+        # late notification. Batch IDs keep identical filenames in projects apart.
+        name = Path(download_path).name
+        task = next((task for task in batch['tasks'] if Path(task.get('download_path', '')).name == name), None)
+        if not task:
+            self._log(f'   ⚠️ {name} 不在该批任务中，未自动移动')
+            return
+        key = (str(Path(batch['project_path']).resolve()), name)
+        if key in self._relocation_jobs:
+            return
+        roots = [self.mw.storage_manager.get_base_path(), Path.home() / 'Downloads']
+        self._relocation_jobs[key] = {'project': batch['project_path'], 'target': task['download_path'],
+                                      'roots': roots, 'attempt': 0}
+        self._start_video_relocation(key)
+
+    def _start_video_relocation(self, key):
+        from concurrent.futures import ThreadPoolExecutor
+        from services.video_relocation import relocate_downloaded_video
+        job = self._relocation_jobs.get(key)
+        if not job:
+            return
+        if self._relocation_pool is None:
+            self._relocation_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix='video-relocation')
+            pool = self._relocation_pool
+            self.destroyed.connect(lambda: pool.shutdown(wait=False, cancel_futures=True))
+        job['attempt'] += 1
+        future = self._relocation_pool.submit(relocate_downloaded_video, job['project'], job['target'], job['roots'])
+        def completed(result):
+            try:
+                payload = result.result()
+            except Exception as error:
+                payload = {'status': 'retry', 'message': str(error)}
+            try:
+                self.relocation_finished.emit({'key': key, 'result': payload})
+            except RuntimeError:
+                pass  # The window was closed while the file operation finished.
+        future.add_done_callback(completed)
+
+    def _on_video_relocated(self, payload):
+        key, result = payload['key'], payload['result']
+        job = self._relocation_jobs.get(key)
+        if not job:
+            return
+        status = result.get('status')
+        if status in ('missing', 'retry') and job['attempt'] < 4:
+            QTimer.singleShot(1000 * job['attempt'], lambda k=key: self._start_video_relocation(k))
+            return
+        self._relocation_jobs.pop(key, None)
+        if status in ('moved', 'already'):
+            self._log(f"   📦 {key[1]} {'已自动检查归位' if status == 'moved' else '检查通过，已在项目目录'}")
+            if result.get('warning'):
+                self._log('   ⚠️ ' + result['warning'])
+            self._after_project_change(job['project'], reload_list=True)
+        else:
+            self._log(f"   ⚠️ {key[1]} 自动归位未完成：{result.get('message', '未知错误')}；可在“批量检查视频”中手动重试")
+        self._check_all_done()
 
     def _after_project_change(self, project_path, reload_list=False):
         try:
@@ -1106,6 +1192,8 @@ class HostedModeWidget(QWidget):
         active = [b for b in self.batches if b["run_state"] in ("已发送", "生成中")]
         waiting = [b for b in self.batches if b["cid"] and b["run_state"] == "未开始" and b["upload_state"] == "成功"]
         if active or waiting:
+            return
+        if self._relocation_jobs:
             return
         self.running = False
         ok = sum(b["ok"] for b in self.batches)

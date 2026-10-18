@@ -1,6 +1,6 @@
 # -*- mode: python ; coding: utf-8 -*-
 """
-PyInstaller spec file for Flow口播工具
+PyInstaller spec file for Flow
 Generates a one-folder distributable with all dependencies.
 """
 
@@ -25,7 +25,6 @@ a = Analysis(
     pathex=[project_dir],
     binaries=[],
     datas=[
-        ('logo.ico', '.'),
         ('camera_motions.example.json', '.'),
         ('prompt_templates.example.json', '.'),
         ('plugin_script_adapter.js', '.'),
@@ -109,7 +108,7 @@ exe = EXE(
     a.scripts,
     [],
     exclude_binaries=True,
-    name='FlowCue',
+    name='Flow',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
@@ -120,7 +119,7 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon='logo.ico',       # Application icon
+    icon='NONE',
 )
 
 coll = COLLECT(
@@ -131,5 +130,5 @@ coll = COLLECT(
     strip=False,
     upx=True,
     upx_exclude=[],
-    name='FlowCue',
+    name='Flow',
 )

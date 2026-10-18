@@ -42,7 +42,7 @@ class BatchProjectModel:
         return project
 
     def save_project(self, project):
-        file_path = self.batch_dir / f"{project['id']}.json"
+        file_path = self._project_path(project['id'])
         try:
             with open(file_path, "w", encoding="utf-8") as f:
                 json.dump(project, f, ensure_ascii=False, indent=2)
@@ -50,7 +50,18 @@ class BatchProjectModel:
             print(f"Error saving {file_path}: {e}")
 
     def delete_project(self, project_id):
-        file_path = self.batch_dir / f"{project_id}.json"
+        file_path = self._project_path(project_id)
         if file_path.exists():
             file_path.unlink()
         self.projects = [p for p in self.projects if p["id"] != project_id]
+
+    def _project_path(self, project_id):
+        if (not isinstance(project_id, str) or not project_id
+                or project_id in ('.', '..')
+                or any(char in project_id for char in '/\\:')
+                or any(ord(char) < 32 for char in project_id)):
+            raise ValueError('批次项目 ID 不能包含路径')
+        path = (self.batch_dir / f'{project_id}.json').resolve()
+        if path.parent != self.batch_dir.resolve():
+            raise ValueError('批次项目路径超出目录')
+        return path

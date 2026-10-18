@@ -17,6 +17,7 @@ from PyQt6.QtGui import QDesktopServices, QGuiApplication, QCursor, QPixmap
 from models.project_model import ProjectModel
 from services.text_processor import TextProcessor
 from services.downloader import DownloadThread
+from services.security import report_video_path, https_host_allowed, project_image_path
 
 
 def flip_image_horizontally_replace(file_path) -> Path:
@@ -95,7 +96,9 @@ def encode_image_to_data_url(file_path) -> str:
         ".gif": "image/gif",
         ".bmp": "image/bmp"
     }
-    mime = mime_map.get(ext, "image/jpeg")
+    if ext not in mime_map or path.stat().st_size > 50 * 1024 * 1024:
+        return ""
+    mime = mime_map[ext]
     try:
         raw = path.read_bytes()
         b64 = base64.b64encode(raw).decode("ascii")
@@ -123,6 +126,7 @@ class ProjectDetailWidget(QWidget):
         self.polling_timer = None
         self.active_batch_dialog = None
         self.enable_end_frame = False
+        self._image_assignment_undo = None
         self.current_prop_row = -1
         self.init_ui()
 
@@ -439,6 +443,22 @@ class ProjectDetailWidget(QWidget):
         
         right_layout.addLayout(table_header_layout)
         
+        image_actions = QHBoxLayout()
+        self.btn_assign_images = QPushButton("🖼️ 一键分配图片")
+        self.btn_assign_images.setToolTip("选择参与的图片和分句，预览首尾帧连续分配结果")
+        self.btn_assign_images.clicked.connect(self.open_image_assignment_dialog)
+        image_actions.addWidget(self.btn_assign_images)
+        self.btn_undo_image_assignment = QPushButton("↩ 撤销图片分配")
+        self.btn_undo_image_assignment.setToolTip("撤销当前项目最近一次分配；保留之后的手动调整。切换项目后不保留撤销记录。")
+        self.btn_undo_image_assignment.setEnabled(False)
+        self.btn_undo_image_assignment.clicked.connect(self.undo_image_assignment)
+        image_actions.addWidget(self.btn_undo_image_assignment)
+        selection_hint = QLabel("按住 Ctrl / Shift 可选择多个分句")
+        selection_hint.setStyleSheet("color: #8D6E63; font-size: 12px;")
+        image_actions.addWidget(selection_hint)
+        image_actions.addStretch()
+        right_layout.addLayout(image_actions)
+
         # Inner splitter for Table and Property Panel
         self.table_splitter = QSplitter(Qt.Orientation.Horizontal)
         
@@ -448,7 +468,7 @@ class ProjectDetailWidget(QWidget):
             "序号", "分句文案 (双击可修改)", "字数", "时长 (秒)", "生成的提示词 (双击可复制)", "操作"
         ])
         self.table_segments.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        self.table_segments.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.table_segments.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.table_segments.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
         self.table_segments.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Interactive)
         self.table_segments.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
@@ -456,6 +476,8 @@ class ProjectDetailWidget(QWidget):
         self.table_segments.cellChanged.connect(self.on_cell_changed)
         self.table_segments.cellDoubleClicked.connect(self.on_cell_double_clicked)
         self.table_segments.currentItemChanged.connect(self.on_table_selection_changed)
+        self.table_segments.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.table_segments.customContextMenuRequested.connect(self.show_segment_prompt_menu)
         
         self.table_splitter.addWidget(self.table_segments)
         
@@ -559,6 +581,10 @@ class ProjectDetailWidget(QWidget):
         self.list_media.currentItemChanged.connect(self.on_media_selection_changed)
         left_layout.addWidget(self.list_media)
         
+        self.btn_assign_selected_media = QPushButton("🖼️ 用所选图片分配首尾帧…")
+        self.btn_assign_selected_media.clicked.connect(self.open_image_assignment_dialog)
+        left_layout.addWidget(self.btn_assign_selected_media)
+
         # Rename, Flip & Delete buttons
         media_btn_layout = QHBoxLayout()
         media_btn_layout.setSpacing(6)
@@ -656,6 +682,8 @@ class ProjectDetailWidget(QWidget):
 
     def set_project(self, project_path):
         """Loads and binds project data."""
+        self._image_assignment_undo = None
+        self.btn_undo_image_assignment.setEnabled(False)
         self.project_path = Path(project_path)
         self.project_model = ProjectModel(self.project_path)
         self.copied_rows = set()
@@ -686,14 +714,10 @@ class ProjectDetailWidget(QWidget):
         if hasattr(self, "container_end_image"):
             self.container_end_image.setVisible(self.enable_end_frame)
 
-        # Populate table segments
+        # Select the project's templates before rendering the table once.
+        self.refresh_template_comboboxes(refresh_table=False)
         self.populate_segments_table()
-        
-        # Refresh media list
         self.refresh_media_list()
-        
-        # Refresh templates dropdowns & prompts table
-        self.refresh_template_comboboxes()
         
         # Check if this project has an active background download running in MainWindow
         main_win = self.window()
@@ -730,20 +754,20 @@ class ProjectDetailWidget(QWidget):
         
         for idx, seg in enumerate(segments):
             # 智能解析关联首帧图片素材
-            img_name, _, _ = self.resolve_segment_image_and_data(idx, seg)
+            img_name, _, _ = self.resolve_segment_image_and_data(idx, seg, encode_data=False)
             if img_name:
                 seg["image_name"] = img_name
 
             # 智能解析关联尾帧图片素材（若启用）
             if getattr(self, "enable_end_frame", False):
-                end_img_name, _, _ = self.resolve_segment_end_image_and_data(idx, seg)
+                end_img_name, _, _ = self.resolve_segment_end_image_and_data(idx, seg, encode_data=False)
                 if end_img_name:
                     seg["end_image_name"] = end_img_name
 
             # 0. Index & Icons (📷: 首帧图片, 🎬: 尾帧图片, ⚙️: 自定义模板/运镜)
             has_image = bool(seg.get("image_name"))
             has_end_image = bool(seg.get("end_image_name")) if getattr(self, "enable_end_frame", False) else False
-            has_custom = bool(seg.get("template_id")) or bool(seg.get("motion_id"))
+            has_custom = bool(seg.get("template_id")) or bool(seg.get("motion_id")) or 'content' in self.project_model.prompt_store.get(seg)
             idx_text = str(idx + 1)
             if has_image:
                 idx_text += " 📷"
@@ -836,11 +860,11 @@ class ProjectDetailWidget(QWidget):
                 seg["copied"] = True
                 seg["completed"] = True
                 self.copied_rows.add(idx)
-                self.change_row_color(idx, copied=True)
+                self.change_row_color(idx, copied=True, persist=False)
             else:
                 seg["copied"] = False
                 seg["completed"] = False
-                self.change_row_color(idx, copied=False)
+                self.change_row_color(idx, copied=False, persist=False)
             
         self.table_segments.blockSignals(False)
         self.filter_segments_table()
@@ -1064,7 +1088,7 @@ class ProjectDetailWidget(QWidget):
         QToolTip.showText(QCursor.pos(), "已复制完整提示词！", dialog)
         self.change_row_color(row, copied=True)
 
-    def change_row_color(self, row, copied=True):
+    def change_row_color(self, row, copied=True, *, persist=True):
         """Change the background color of a specific row to indicate status."""
         from PyQt6.QtGui import QColor
         if not hasattr(self, 'copied_rows'):
@@ -1080,8 +1104,11 @@ class ProjectDetailWidget(QWidget):
             self.copied_rows.discard(row)
 
         if self.project_model and row < len(self.project_model.spanish_segments):
-            self.project_model.spanish_segments[row]["copied"] = copied
-            self.project_model.save()
+            segment = self.project_model.spanish_segments[row]
+            changed = segment.get("copied") != copied
+            segment["copied"] = copied
+            if persist and changed:
+                self.project_model.save()
 
         for col in range(5):
             item = self.table_segments.item(row, col)
@@ -1643,7 +1670,7 @@ class ProjectDetailWidget(QWidget):
             msg += f"\n已清除 {cleared_count} 处分句素材关联引用。"
         QMessageBox.information(self, "删除成功", msg)
 
-    def refresh_template_comboboxes(self):
+    def refresh_template_comboboxes(self, *, refresh_table=True):
         """Loads prompt templates and motions lists into dropdown selectors."""
         if not self.template_manager:
             return
@@ -1678,7 +1705,8 @@ class ProjectDetailWidget(QWidget):
         self.combo_templates.blockSignals(False)
         self.combo_motions.blockSignals(False)
         
-        self.populate_segments_table()
+        if refresh_table:
+            self.populate_segments_table()
 
     def on_template_changed(self):
         if not self.project_model:
@@ -1904,7 +1932,113 @@ class ProjectDetailWidget(QWidget):
         for r in range(self.table_segments.rowCount()):
             self.refresh_table_row_index_label(r)
 
-    def resolve_segment_image_and_data(self, idx, seg):
+    def open_image_assignment_dialog(self):
+        if not self.project_model or not self.project_model.spanish_segments:
+            QMessageBox.information(self, "提示", "请先打开包含分句的项目。")
+            return
+        from views.image_assignment_dialog import ImageAssignmentDialog
+        downloads = self.project_path / "downloads"
+        extensions = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp"}
+        images = [p.name for p in downloads.iterdir() if p.is_file() and p.suffix.lower() in extensions] if downloads.exists() else []
+        if not images:
+            QMessageBox.information(self, "提示", "当前项目没有图片，请先下载或添加图片素材。")
+            return
+        rows = sorted({index.row() for index in self.table_segments.selectionModel().selectedRows()})
+        selected_images = [item.data(Qt.ItemDataRole.UserRole) for item in self.list_media.selectedItems()]
+        dialog = ImageAssignmentDialog(self.project_model.spanish_segments, images, rows,
+                                       selected_images, self.enable_end_frame, self,
+                                       image_dir=downloads, apply_callback=self.apply_image_assignment)
+        dialog.exec()
+
+    def _refresh_image_assignment_ui(self, rows):
+        self.chk_enable_end_frame.blockSignals(True)
+        self.chk_enable_end_frame.setChecked(self.enable_end_frame)
+        self.chk_enable_end_frame.blockSignals(False)
+        self.container_end_image.setVisible(self.enable_end_frame)
+        for row in rows:
+            self.refresh_table_row_index_label(row)
+        current = self.table_segments.currentItem()
+        if current:
+            self.on_table_selection_changed(current, None)
+
+    def apply_image_assignment(self, plan, end_frames):
+        if not self.project_model:
+            return False
+        segments = self.project_model.spanish_segments
+        changes = []
+        for entry in plan:
+            row = entry['row']
+            updates = entry['changes']
+            if not updates:
+                continue
+            for name in updates.values():
+                path = (self.project_path / "downloads" / name).resolve()
+                if path.parent != (self.project_path / "downloads").resolve() or not path.is_file():
+                    QMessageBox.warning(self, "图片已变更", f"图片 {name} 不存在，请重新打开分配窗口。")
+                    return False
+            segment = segments[row]
+            before = {key: segment[key] for key in updates if key in segment}
+            changes.append((segment, before, dict(updates)))
+        previous_mode = self.enable_end_frame
+        previous_override = self.project_model.enable_end_frame
+        if not changes and previous_mode == end_frames:
+            return False
+        for segment, before, updates in changes:
+            segment.update(updates)
+        self.project_model.enable_end_frame = end_frames
+        if not self.project_model.save():
+            for segment, before, updates in changes:
+                for key in updates:
+                    if key in before:
+                        segment[key] = before[key]
+                    else:
+                        segment.pop(key, None)
+            self.project_model.enable_end_frame = previous_override
+            QMessageBox.critical(self, "保存失败", "图片分配未能保存，请检查项目目录权限后重试。")
+            return False
+        self.enable_end_frame = end_frames
+        self._image_assignment_undo = (changes, previous_mode, previous_override, end_frames)
+        self.btn_undo_image_assignment.setEnabled(True)
+        self._refresh_image_assignment_ui(range(len(segments)))
+        return True
+
+    def undo_image_assignment(self):
+        if not self.project_model or not self._image_assignment_undo:
+            return False
+        changes, previous_mode, previous_override, applied_mode = self._image_assignment_undo
+        segments = self.project_model.spanish_segments
+        active = {id(segment) for segment in segments}
+        restored = []
+        for segment, before, updates in changes:
+            if id(segment) not in active:
+                continue
+            for key, value in updates.items():
+                # Keep any manual adjustments made after the automatic assignment.
+                if segment.get(key) != value:
+                    continue
+                restored.append((segment, key, value))
+                if key in before:
+                    segment[key] = before[key]
+                else:
+                    segment.pop(key, None)
+        old_override = self.project_model.enable_end_frame
+        old_mode = self.enable_end_frame
+        if old_override == applied_mode:
+            self.project_model.enable_end_frame = previous_override
+            self.enable_end_frame = previous_mode
+        if not self.project_model.save():
+            for segment, key, value in restored:
+                segment[key] = value
+            self.project_model.enable_end_frame = old_override
+            self.enable_end_frame = old_mode
+            QMessageBox.critical(self, "保存失败", "撤销未能保存，请检查项目目录后重试。")
+            return False
+        self._image_assignment_undo = None
+        self.btn_undo_image_assignment.setEnabled(False)
+        self._refresh_image_assignment_ui(range(len(segments)))
+        return True
+
+    def resolve_segment_image_and_data(self, idx, seg, *, encode_data=True):
         """
         智能解析分句关联的图片文件名、绝对路径以及 Base64 Data URL：
         1. 优先检查 seg 中显式绑定的 image_name 是否真实存在于 downloads/；
@@ -1912,7 +2046,7 @@ class ProjectDetailWidget(QWidget):
         3. 若工程内仅有 1 张图片，所有分句自动共用该图片；
         4. 若工程内有多张图片，按文件名升序排序后，自动关联第 idx 张；
         5. 若图片数量少于分句数，循环取模取用或使用首张；
-        6. 自动将图片文件读取并编码为 base64 data url (如 data:image/png;base64,xxxx)，确保浏览器能 100% 自动上传！
+        6. 仅在 encode_data=True 时读取并编码图片；界面刷新只解析关联。
         """
         if not self.project_path:
             return "", "", ""
@@ -1923,7 +2057,8 @@ class ProjectDetailWidget(QWidget):
 
         img_extensions = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"}
         try:
-            all_imgs = [item for item in downloads_dir.iterdir() if item.is_file() and item.suffix.lower() in img_extensions]
+            all_imgs = [item for item in downloads_dir.iterdir() if item.is_file()
+                        and project_image_path(self.project_path, item.name) is not None]
             all_imgs.sort(key=lambda x: x.name)
         except Exception:
             return "", "", ""
@@ -1934,10 +2069,11 @@ class ProjectDetailWidget(QWidget):
         chosen_img_obj = None
 
         # 1. 优先检查 seg 中的显式绑定
-        explicit_name = seg.get("image_name", "").strip() if isinstance(seg, dict) else ""
+        explicit_name = seg.get("image_name", "") if isinstance(seg, dict) else ""
+        explicit_name = explicit_name.strip() if isinstance(explicit_name, str) else ""
         if explicit_name:
-            cand = downloads_dir / explicit_name
-            if cand.exists() and cand.is_file():
+            cand = project_image_path(self.project_path, explicit_name)
+            if cand is not None and cand.exists() and cand.is_file():
                 chosen_img_obj = cand
 
         # 2. 按序号匹配 (1.jpg, 01.jpg, 1_*.jpg 等)
@@ -1967,20 +2103,8 @@ class ProjectDetailWidget(QWidget):
         chosen_name = chosen_img_obj.name
         chosen_path = str(chosen_img_obj.resolve())
 
-        # 5. 编码为 Base64 Data URL
-        import base64
-        import mimetypes
-        mime_type, _ = mimetypes.guess_type(chosen_path)
-        if not mime_type:
-            mime_type = "image/png"
-
-        data_url = ""
-        try:
-            with open(chosen_img_obj, "rb") as f:
-                b64_str = base64.b64encode(f.read()).decode("utf-8")
-                data_url = f"data:{mime_type};base64,{b64_str}"
-        except Exception as e:
-            logger.warning(f"读取图片 Base64 失败 [{chosen_name}]: {e}")
+        # Display and scheduling need only the association; encoding is optional.
+        data_url = encode_image_to_data_url(chosen_path) if encode_data else ""
 
         # 同步回写进 seg 中
         if isinstance(seg, dict):
@@ -1988,12 +2112,12 @@ class ProjectDetailWidget(QWidget):
 
         return chosen_name, chosen_path, data_url
 
-    def resolve_segment_end_image_and_data(self, idx, seg):
+    def resolve_segment_end_image_and_data(self, idx, seg, *, encode_data=True):
         """
         解析分句关联的尾帧图片文件名、绝对路径以及 Base64 Data URL：
         1. 仅当启用尾帧功能时生效；
         2. 检查 seg 中显式绑定的 end_image_name 是否真实存在于 downloads/；
-        3. 若存在，自动读取并编码为 base64 data url；
+        3. 仅在 encode_data=True 时读取并编码图片；
         4. 若未开启或未指定，返回 ("", "", "")。
         """
         if not getattr(self, "enable_end_frame", False) or not self.project_path:
@@ -2003,29 +2127,18 @@ class ProjectDetailWidget(QWidget):
         if not downloads_dir.exists():
             return "", "", ""
 
-        end_name = seg.get("end_image_name", "").strip() if isinstance(seg, dict) else ""
+        end_name = seg.get("end_image_name", "") if isinstance(seg, dict) else ""
+        end_name = end_name.strip() if isinstance(end_name, str) else ""
         if not end_name:
             return "", "", ""
 
-        cand = downloads_dir / end_name
-        if not cand.exists() or not cand.is_file():
+        cand = project_image_path(self.project_path, end_name)
+        if cand is None or not cand.exists() or not cand.is_file():
             return "", "", ""
 
         end_path = str(cand.resolve())
 
-        import base64
-        import mimetypes
-        mime_type, _ = mimetypes.guess_type(end_path)
-        if not mime_type:
-            mime_type = "image/png"
-
-        data_url = ""
-        try:
-            with open(cand, "rb") as f:
-                b64_str = base64.b64encode(f.read()).decode("utf-8")
-                data_url = f"data:{mime_type};base64,{b64_str}"
-        except Exception as e:
-            logger.warning(f"读取尾帧图片 Base64 失败 [{end_name}]: {e}")
+        data_url = encode_image_to_data_url(end_path) if encode_data else ""
 
         return end_name, end_path, data_url
 
@@ -2099,6 +2212,12 @@ class ProjectDetailWidget(QWidget):
         # Refresh combo lists & placeholders
         self.refresh_prop_image_combo_items()
         self.refresh_prop_template_motion_combos()
+
+        # The refresh helpers unblock their own combos. Selecting a row must
+        # remain display-only, including when an automatic assignment redraws it.
+        for combo in (self.combo_prop_image, self.combo_prop_end_image,
+                      self.combo_prop_template, self.combo_prop_motion, self.combo_prop_mode):
+            combo.blockSignals(True)
         
         # Select current image (首帧)
         image_name = seg.get("image_name", "")
@@ -2285,6 +2404,7 @@ class ProjectDetailWidget(QWidget):
         
         # Refresh the index cell text to display the camera emoji if selected
         self.refresh_table_row_index_label(row)
+        self.project_model.save()
 
     def on_prop_end_image_changed(self):
         row = getattr(self, "current_prop_row", -1)
@@ -2330,7 +2450,7 @@ class ProjectDetailWidget(QWidget):
         seg = self.project_model.spanish_segments[row]
         has_image = bool(seg.get("image_name"))
         has_end_image = bool(seg.get("end_image_name")) if getattr(self, "enable_end_frame", False) else False
-        has_custom = bool(seg.get("template_id")) or bool(seg.get("motion_id"))
+        has_custom = bool(seg.get("template_id")) or bool(seg.get("motion_id")) or 'content' in self.project_model.prompt_store.get(seg)
         index_label = str(row + 1)
         if has_image:
             index_label += " 📷"
@@ -2359,6 +2479,10 @@ class ProjectDetailWidget(QWidget):
         if not tpl_id:
             tpl_id = self.combo_templates.currentData()
         tpl = self.template_manager.get_template(tpl_id)
+        local = self.project_model.prompt_store.get(seg)
+        if 'content' in local:
+            tpl = {**(tpl or {}), 'content': local['content'],
+                   'name': local.get('source_name') or (tpl or {}).get('name', '项目副本')}
         
         # 2. Motion resolution
         motion_id = seg.get("motion_id", "")
@@ -2367,6 +2491,63 @@ class ProjectDetailWidget(QWidget):
         motion = self.template_manager.get_motion(motion_id)
         
         return tpl, motion
+
+    def get_project_prompt_source(self, row):
+        segment = self.project_model.spanish_segments[row]
+        base = self.template_manager.get_template(segment.get('template_id') or self.combo_templates.currentData())
+        template, motion = self.get_effective_template_and_motion(row)
+        return {'template_id': segment.get('template_id') or self.combo_templates.currentData() or '',
+                'name': (template or base or {}).get('name', '直接使用文案'),
+                'content': (template or {}).get('content', '{spanish_text}'),
+                'original_content': (base or {}).get('content', '{spanish_text}'),
+                'motion': (motion or {}).get('content', '')}
+
+    def selected_prompt_rows(self):
+        return sorted({index.row() for index in self.table_segments.selectionModel().selectedRows()
+                       if not self.table_segments.isRowHidden(index.row())})
+
+    def show_segment_prompt_menu(self, position):
+        item = self.table_segments.itemAt(position)
+        if item is None or not self.project_model:
+            return
+        if item.row() not in self.selected_prompt_rows():
+            self.table_segments.selectRow(item.row())
+        rows = self.selected_prompt_rows()
+        menu = QMenu(self)
+        action = menu.addAction(f'编辑选中 {len(rows)} 句的提示词…')
+        from services.project_prompts import common_prompt_source
+        try:
+            common_prompt_source([self.get_project_prompt_source(row) for row in rows])
+        except ValueError as error:
+            action.setText('无法编辑：所选模板或版本不同' if len(rows) > 1 else '无法编辑：缺少文案占位符')
+            action.setToolTip(str(error))
+            action.setEnabled(False)
+        action.triggered.connect(self.edit_selected_prompts)
+        menu.exec(self.table_segments.viewport().mapToGlobal(position))
+
+    def edit_selected_prompts(self):
+        if not self.project_model:
+            return
+        from services.project_prompts import common_prompt_source
+        from views.project_prompt_dialog import ProjectPromptEditDialog
+        sources = {row: self.get_project_prompt_source(row) for row in self.selected_prompt_rows()}
+        try:
+            common_prompt_source(list(sources.values()))
+        except ValueError as error:
+            QMessageBox.information(self, '无法一起编辑', str(error))
+            return
+        dialog = ProjectPromptEditDialog(sources, self.apply_project_prompt_edits, self)
+        dialog.exec()
+
+    def apply_project_prompt_edits(self, updates):
+        try:
+            self.project_model.prompt_store.apply(self.project_model, updates)
+        except (OSError, ValueError) as error:
+            QMessageBox.warning(self, '项目提示词未保存', str(error))
+            return False
+        for row in updates:
+            self.update_segment_row_prompt(row)
+        return True
 
     def refresh_prop_template_motion_combos(self):
         """Populates the property panel template and motion dropdowns with dynamic fallback label."""
@@ -2422,6 +2603,11 @@ class ProjectDetailWidget(QWidget):
             return
             
         tpl_id = self.combo_prop_template.currentData()
+        # Selecting another source template replaces this sentence's project copy;
+        # its group remains available for later batch edits.
+        if 'content' in self.project_model.prompt_store.get(self.project_model.spanish_segments[row]):
+            if not self.apply_project_prompt_edits({row: {'content': None, 'source_name': None}}):
+                return
         self.project_model.spanish_segments[row]["template_id"] = tpl_id if tpl_id else ""
         self.update_segment_row_prompt(row)
         self.project_model.save()
@@ -2469,7 +2655,7 @@ class ProjectDetailWidget(QWidget):
         
         # Re-apply row color if copied
         if hasattr(self, 'copied_rows') and row in self.copied_rows:
-            self.change_row_color(row, copied=True)
+            self.change_row_color(row, copied=True, persist=False)
             
         self.table_segments.blockSignals(False)
 
@@ -2487,6 +2673,11 @@ class ProjectDetailWidget(QWidget):
         )
         
         if reply == QMessageBox.StandardButton.Yes:
+            local_rows = {row: {'content': None, 'source_name': None}
+                          for row, seg in enumerate(self.project_model.spanish_segments)
+                          if 'content' in self.project_model.prompt_store.get(seg)}
+            if local_rows and not self.apply_project_prompt_edits(local_rows):
+                return
             for seg in self.project_model.spanish_segments:
                 seg["template_id"] = ""
                 seg["motion_id"] = ""
@@ -2516,6 +2707,8 @@ class ProjectDetailWidget(QWidget):
         """
         if not self.project_model:
             return {"batches": [], "skipped": 0, "error": "请先打开一个工程项目。"}
+        if self.project_model.prompt_store.error:
+            return {"batches": [], "skipped": 0, "error": "项目提示词文件读取失败，请先修复：" + self.project_model.prompt_store.error}
             
         segments = self.project_model.spanish_segments
         if not segments:
@@ -2596,7 +2789,7 @@ class ProjectDetailWidget(QWidget):
             download_name = f"{idx+1:02d}.mp4"
             download_path = str((videos_dir / download_name).resolve())
             
-            end_image_name, end_local_image_path, _ = self.resolve_segment_end_image_and_data(idx, seg)
+            end_image_name, end_local_image_path, _ = self.resolve_segment_end_image_and_data(idx, seg, encode_data=False)
 
             task_dict = {
                 "prompt": final_prompt,
@@ -2743,61 +2936,31 @@ class ProjectDetailWidget(QWidget):
         chrome_downloads = Path.home() / "Downloads"
         
         for item in report_data:
+            if not isinstance(item, dict):
+                continue
             target_path_str = item.get("download_path")
             status = item.get("status")
             
             if not target_path_str or status != "success":
                 continue
                 
-            # 安全边界校验：确保目标路径在工程目录或当前基础存储路径下
-            if self.project_path:
-                try:
-                    resolved_target = Path(target_path_str).resolve()
-                    base_storage = self.project_path.parent.resolve()
-                    if not (resolved_target.is_relative_to(self.project_path.resolve()) or resolved_target.is_relative_to(base_storage)):
-                        continue
-                except Exception:
+            try:
+                target_path = report_video_path(self.project_path, target_path_str)
+                if target_path.exists():
                     continue
-                
-            target_path = Path(target_path_str)
+            except (ValueError, TypeError, OSError):
+                continue
             filename = target_path.name
             
-            possible_sources = [
-                chrome_downloads / "Flow" / self.project_model.project_id / filename,
-                chrome_downloads / "Flow" / f"{self.project_model.project_id}-flow" / filename,
-                chrome_downloads / "Flow" / filename,
-                chrome_downloads / filename,
-            ]
-            
-            source_file = None
-            for p in possible_sources:
-                if p.exists() and p.is_file():
-                    source_file = p
-                    break
-                    
-            if not source_file:
-                flow_dir = chrome_downloads / "Flow"
-                if flow_dir.exists():
-                    found_files = list(flow_dir.glob(f"**/{filename}"))
-                    if found_files:
-                        source_file = found_files[0]
-                        
-            if not source_file:
-                found_files = list(chrome_downloads.glob(f"**/{filename}"))
-                if found_files:
-                    source_file = found_files[0]
-                    
-            if source_file:
-                try:
-                    target_path.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.move(str(source_file), str(target_path))
-                    success_count += 1
-                except Exception as err:
-                    print(f"Error moving file {source_file} to {target_path}: {err}")
-                    fail_count += 1
+            from services.video_relocation import relocate_downloaded_video
+            result = relocate_downloaded_video(self.project_path, target_path, [chrome_downloads])
+            if result['status'] == 'moved':
+                success_count += 1
+            elif result['status'] == 'already':
+                continue
             else:
                 not_found_paths.append(filename)
-                
+
         self.refresh_media_list()
         
         if self.project_model:
@@ -2821,235 +2984,75 @@ class ProjectDetailWidget(QWidget):
             QMessageBox.warning(self, "未找到文件", msg)
 
     def on_plugin_report_received(self, report_data):
-        """Processes execution report received via WebSocket from a browser plugin."""
-        if not self.project_model or not self.project_path:
+        """Archive only this project's exact video; report data cannot choose a write path."""
+        if not self.project_model or not self.project_path or not isinstance(report_data, dict):
             return
-            
-        safe_proj_root = Path(self.project_path).resolve()
-        data = report_data.get("data", [])
-        segments = self.project_model.spanish_segments
-        chrome_downloads = Path.home() / "Downloads"
         import base64
-        import shutil
+        import requests
+        from services.security import get_with_checked_redirects, publish_video_chunks
+        from services.video_relocation import relocate_downloaded_video
 
+        data = report_data.get('data', [])
+        if not isinstance(data, list):
+            return
+        segments = self.project_model.spanish_segments
         updated_count = 0
+        retry_items = []
         for item in data:
-            idx = item.get("index")
-            status = item.get("status", "success")
-            download_url = item.get("download_url")
-            target_path_str = item.get("download_path")
-            base64_data = item.get("base64Data") or item.get("base64_data")
+            if not isinstance(item, dict) or item.get('status', 'success') != 'success':
+                continue
+            idx = item.get('index')
+            if (type(idx) is not int or not 0 <= idx < len(segments)) and isinstance(item.get('prompt'), str) and item['prompt']:
+                matches = [i for i, segment in enumerate(segments) if item['prompt'] in segment.get('text', '')]
+                if len(matches) == 1:
+                    idx = matches[0]
+            if type(idx) is int and idx == len(segments):
+                idx -= 1  # Legacy final 1-based report.
+            if type(idx) is not int or not 0 <= idx < len(segments):
+                continue
+            try:
+                target = report_video_path(self.project_path, Path(self.project_path) / 'downloads' / 'videos' / f'{idx + 1:02d}.mp4')
+                result = relocate_downloaded_video(self.project_path, target, [Path.home() / 'Downloads'])
+                complete = result['status'] in ('moved', 'already')
+                encoded = item.get('base64Data') or item.get('base64_data')
+                if not complete and isinstance(encoded, str):
+                    if len(encoded) > 128 * 1024 * 1024:
+                        raise ValueError('Base64 视频超过大小上限')
+                    decoded = base64.b64decode(encoded, validate=True)
+                    publish_video_chunks(self.project_path, target, [decoded])
+                    complete = True
+                url = item.get('download_url')
+                if not complete and url:
+                    allowed = lambda value: https_host_allowed(value, (
+                        'flow-content.google', 'labs.google', 'googleusercontent.com',
+                        'usercontent.google.com', 'docs.google.com', 'googlevideo.com'), subdomains=True)
+                    with requests.Session() as session:
+                        session.trust_env = False
+                        with get_with_checked_redirects(session, url, allowed, stream=True, timeout=(15, 60)) as response:
+                            response.raise_for_status()
+                            publish_video_chunks(self.project_path, target, response.iter_content(16384))
+                            complete = True
+                if not complete:
+                    retry_items.append(item)
+                    continue
+            except Exception as error:
+                # Neither URLs nor raw exception text (possibly signed URLs) go to logs.
+                logger.warning('插件报告视频归档未完成: %s', type(error).__name__)
+                continue
+            if hasattr(self, 'dispatched_indices'):
+                self.dispatched_indices.discard(idx)
+            segments[idx].update(copied=True, completed=True, status='success')
+            self.copied_rows.add(idx)
+            updated_count += 1
 
-            # 兼容通过 prompt 反查 index
-            if (idx is None or not isinstance(idx, int) or idx < 0 or idx >= len(segments)) and item.get("prompt"):
-                for s_idx, seg in enumerate(segments):
-                    if item.get("prompt") in seg.get("text", ""):
-                        idx = s_idx
-                        break
-
-            # 兼容 1-indexed 索引 (例如 1..len(segments))
-            if idx is not None and isinstance(idx, int):
-                if idx >= len(segments) and idx - 1 < len(segments):
-                    idx = idx - 1
-
-            if idx is not None and isinstance(idx, int) and 0 <= idx < len(segments):
-                if hasattr(self, 'dispatched_indices') and idx in self.dispatched_indices:
-                    self.dispatched_indices.discard(idx)
-
-            if status == "success" and idx is not None and isinstance(idx, int) and 0 <= idx < len(segments):
-                segments[idx]["copied"] = True
-                segments[idx]["completed"] = True
-                segments[idx]["status"] = "success"
-                self.copied_rows.add(idx)
-                updated_count += 1
-                
-                # 校验并规范化 target_path_str 安全边界 (严格保证在工程目录内部)
-                videos_dir = (safe_proj_root / "downloads" / "videos").resolve()
-                videos_dir.mkdir(parents=True, exist_ok=True)
-                fallback_path_str = str((videos_dir / f"{idx + 1:02d}.mp4").resolve())
-
-                if target_path_str:
-                    try:
-                        resolved_target = Path(target_path_str).resolve()
-                        if not resolved_target.is_relative_to(safe_proj_root):
-                            target_path_str = fallback_path_str
-                    except Exception:
-                        target_path_str = fallback_path_str
-                else:
-                    target_path_str = fallback_path_str
-
-                download_success = False
-                target_filename = item.get("target_filename")
-                project_name = item.get("project_name")
-                
-                # 安全过滤：提取纯文件名与工程名，防止目录穿越
-                clean_target_filename = Path(str(target_filename)).name if target_filename else None
-                clean_project_name = Path(str(project_name)).name if project_name else None
-                resolved_chrome_downloads = chrome_downloads.resolve()
-                
-                # 1. 优先扫描 Chrome Downloads 目录并自动移动/复制至当前工程目录
-                possible_sources = []
-                if clean_project_name and clean_target_filename:
-                    possible_sources.append(chrome_downloads / "Flow" / clean_project_name / clean_target_filename)
-                if clean_target_filename:
-                    possible_sources.append(chrome_downloads / "Flow" / clean_target_filename)
-                
-                if self.project_model:
-                    p_id = Path(str(self.project_model.project_id)).name
-                    filename = Path(str(target_path_str)).name
-                    possible_sources.extend([
-                        chrome_downloads / "Flow" / p_id / filename,
-                        chrome_downloads / "Flow" / f"{p_id}-flow" / filename,
-                        chrome_downloads / "Flow" / filename,
-                        chrome_downloads / filename,
-                    ])
-
-                source_file = None
-                for p in possible_sources:
-                    try:
-                        resolved_p = p.resolve()
-                        if resolved_p.is_relative_to(resolved_chrome_downloads) and resolved_p.exists() and resolved_p.is_file() and resolved_p.stat().st_size > 1024:
-                            source_file = resolved_p
-                            break
-                    except Exception:
-                        continue
-                
-                # 通配扫描最近在 Downloads/Flow 目录中生成的 mp4 文件
-                if not source_file:
-                    flow_dir = chrome_downloads / "Flow"
-                    if flow_dir.exists():
-                        recent_mp4s = list(flow_dir.glob("**/*.mp4"))
-                        recent_mp4s.sort(key=lambda f: f.stat().st_mtime, reverse=True)
-                        if recent_mp4s:
-                            # 取最新的一个 mp4 文件
-                            source_file = recent_mp4s[0]
-
-                if source_file and target_path_str:
-                    try:
-                        target_path = Path(target_path_str).resolve()
-                        if target_path.is_relative_to(safe_proj_root):
-                            target_path.parent.mkdir(parents=True, exist_ok=True)
-                            shutil.move(str(source_file), str(target_path))
-                            download_success = True
-                            logger.info(f"✅ [Chrome 下载扫描成功] 成功将下载文件 {source_file} 归位移动至: {target_path}")
-                    except Exception as move_err:
-                        logger.warning(f"移动 Chrome 下载文件异常: {move_err}")
-
-                # 2. 次选方案：解码 Base64 视频字节流直接写入
-                if not download_success and base64_data and target_path_str:
-                    try:
-                        target_path = Path(target_path_str).resolve()
-                        if target_path.is_relative_to(safe_proj_root):
-                            target_path.parent.mkdir(parents=True, exist_ok=True)
-                            video_bytes = base64.b64decode(base64_data)
-                            if len(video_bytes) > 1024:
-                                with open(target_path, "wb") as f:
-                                    f.write(video_bytes)
-                                download_success = True
-                                logger.info(f"✅ Base64 视频字节流成功写入: {target_path}")
-                    except Exception as b64_err:
-                        logger.warning(f"解码 Base64 视频失败: {b64_err}")
-
-                # 3. 备用方案：HTTP 直连流下载 (严格校验协议、域名解析防 DNS Rebinding / 私网 / 回环 SSRF，并安全处理重定向与超时)
-                if not download_success and download_url and target_path_str:
-                    dl_url_str = str(download_url).strip()
-                    if dl_url_str.startswith(("http://", "https://")):
-                        try:
-                            from urllib.parse import urlparse, urljoin
-                            import socket
-                            import ipaddress
-                            import requests
-
-                            def is_safe_external_url(url_val):
-                                p = urlparse(url_val)
-                                if p.scheme not in ("http", "https"):
-                                    return False
-                                host = (p.hostname or "").strip().lower()
-                                if not host or host in ("localhost", "127.0.0.1", "::1", "0.0.0.0"):  # nosec B104 - host rejection check
-                                    return False
-                                if host.endswith(".local") or host.endswith(".internal"):
-                                    return False
-                                try:
-                                    addrs = socket.getaddrinfo(host, None)
-                                    if not addrs:
-                                        return False
-                                    for addr in addrs:
-                                        ip_obj = ipaddress.ip_address(addr[4][0])
-                                        if (ip_obj.is_private or ip_obj.is_loopback or 
-                                            ip_obj.is_link_local or ip_obj.is_reserved or 
-                                            ip_obj.is_multicast or ip_obj.is_unspecified):
-                                            return False
-                                    return True
-                                except Exception:
-                                    return False
-
-                            curr_url = dl_url_str
-                            session = requests.Session()
-                            headers = {
-                                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-                            }
-                            resp = None
-                            for _ in range(5):
-                                if not is_safe_external_url(curr_url):
-                                    logger.warning(f"🚨 [Security] 拒绝向私网/回环地址发起直连下载或重定向: {curr_url}")
-                                    resp = None
-                                    break
-                                resp = session.get(curr_url, headers=headers, allow_redirects=False, stream=True, timeout=(15, 60))
-                                if resp.is_redirect or resp.status_code in (301, 302, 303, 307, 308):
-                                    loc = resp.headers.get("Location")
-                                    if not loc:
-                                        break
-                                    curr_url = urljoin(curr_url, loc)
-                                else:
-                                    break
-
-                            if resp and resp.status_code == 200:
-                                target_path = Path(target_path_str).resolve()
-                                if target_path.is_relative_to(safe_proj_root):
-                                    target_path.parent.mkdir(parents=True, exist_ok=True)
-                                    part_path = target_path.with_name(f"{target_path.name}.part")
-                                    try:
-                                        with open(part_path, "wb") as f:
-                                            for chunk in resp.iter_content(chunk_size=16384):
-                                                f.write(chunk)
-                                        if target_path.exists():
-                                            target_path.unlink()
-                                        shutil.move(str(part_path), str(target_path))
-                                        download_success = True
-                                        logger.info(f"✅ HTTP 直连下载成功: {target_path}")
-                                    finally:
-                                        if part_path.exists():
-                                            part_path.unlink(missing_ok=True)
-                        except Exception as dl_err:
-                            logger.warning(f"HTTP 直连下载异常: {dl_err}")
-
-                # 4. 延迟 1.5 秒与 4 秒再次扫描 Chrome 下载目录 (解决 Chrome 写入未完成问题)
-                if not download_success and target_path_str:
-                    def try_delayed_copy(tp_str=target_path_str):
-                        tp = Path(tp_str).resolve()
-                        if not tp.is_relative_to(safe_proj_root):
-                            return
-                        flow_dir = chrome_downloads / "Flow"
-                        if flow_dir.exists():
-                            recent_mp4s = list(flow_dir.glob("**/*.mp4"))
-                            recent_mp4s.sort(key=lambda f: f.stat().st_mtime, reverse=True)
-                            if recent_mp4s:
-                                try:
-                                    tp.parent.mkdir(parents=True, exist_ok=True)
-                                    shutil.copy2(recent_mp4s[0], tp)
-                                    logger.info(f"✅ 延迟扫描归档成功复制 {recent_mp4s[0]} 至: {tp}")
-                                    if hasattr(self, 'populate_segments_table'):
-                                        self.populate_segments_table()
-                                except Exception as e:
-                                    logger.warning(f"延迟复制视频失败: {e}")
-
-                    QTimer.singleShot(1500, try_delayed_copy)
-                    QTimer.singleShot(4000, try_delayed_copy)
-
-        if updated_count > 0:
+        # Retry only the same exact project file, with no recursive rescheduling.
+        if retry_items and not report_data.get('_archive_retry'):
+            for delay_ms in (1500, 4000):
+                QTimer.singleShot(delay_ms, lambda items=list(retry_items): self.on_plugin_report_received(
+                    {'data': items, '_archive_retry': True}))
+        if updated_count:
             self.project_model.save()
             self.populate_segments_table()
-            
         if self.is_auto_polling_active:
             QTimer.singleShot(300, self.run_polling_dispatcher_cycle)
 
@@ -3059,6 +3062,9 @@ class ProjectDetailWidget(QWidget):
         optionally limiting to max_tasks for optimal load-balancing across multiple online workers.
         """
         if not self.project_model or not self.project_model.spanish_segments:
+            return []
+        if self.project_model.prompt_store.error:
+            logger.error('项目提示词文件读取失败，停止任务打包: %s', self.project_model.prompt_store.error)
             return []
 
         segments = self.project_model.spanish_segments
@@ -3105,8 +3111,8 @@ class ProjectDetailWidget(QWidget):
             final_prompt = final_prompt.replace("{camera_motion}", motion_content)
             final_prompt = re.sub(r' +', ' ', final_prompt).strip()
             
-            image_name, local_image_path, image_data_url = self.resolve_segment_image_and_data(idx, seg)
-            end_image_name, end_local_image_path, end_image_data_url = self.resolve_segment_end_image_and_data(idx, seg)
+            image_name, local_image_path, image_data_url = self.resolve_segment_image_and_data(idx, seg, encode_data=False)
+            end_image_name, end_local_image_path, end_image_data_url = self.resolve_segment_end_image_and_data(idx, seg, encode_data=False)
             
             default_mode = getattr(self.config_manager, "default_generation_mode", "VIDEO_FRAMES") if self.config_manager else "VIDEO_FRAMES"
             default_aspect = getattr(self.config_manager, "default_aspect_ratio", "9:16") if self.config_manager else "9:16"

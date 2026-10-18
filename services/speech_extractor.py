@@ -14,8 +14,10 @@ import threading
 import subprocess
 import concurrent.futures
 import requests
+import hashlib
 from pathlib import Path
 from PyQt6.QtCore import QThread, pyqtSignal
+from services.security import https_host_allowed
 
 logger = logging.getLogger(__name__)
 
@@ -56,8 +58,10 @@ class SpeechExtractor:
 
             cmd = [
                 ffmpeg_exe,
+                "-nostdin",
                 "-y",
-                "-i", str(video_path),
+                "-protocol_whitelist", "file,pipe",
+                "-i", str(video_path.resolve()),
                 "-vn",
                 "-ac", "1",
                 "-ar", "16000",
@@ -125,6 +129,7 @@ class SpeechExtractor:
                     SpeechExtractor.GLADIA_UPLOAD_URL,
                     headers=headers,
                     files={"audio": (upload_target.name, f, mime_type)},
+                    allow_redirects=False,
                     timeout=90
                 )
             
@@ -154,6 +159,7 @@ class SpeechExtractor:
                 SpeechExtractor.GLADIA_TRANSCRIPTION_URL,
                 headers={**headers, "Content-Type": "application/json"},
                 json=transcription_payload,
+                allow_redirects=False,
                 timeout=30
             )
             
@@ -172,6 +178,8 @@ class SpeechExtractor:
             result_url = trans_data.get("result_url")
             if not result_url:
                 return {"success": False, "text": "", "error": "Gladia 转录返回结果中缺少 result_url"}
+            if not https_host_allowed(result_url, ('api.gladia.io',)):
+                return {"success": False, "text": "", "error": "Gladia 结果地址不受信任"}
             
             # Step 3: Adaptive polling for result (0.8s, 1.2s, 1.5s, 2.0s...)
             poll_delays = [0.8, 1.2, 1.5, 2.0]
@@ -182,6 +190,7 @@ class SpeechExtractor:
                 poll_response = requests.get(
                     result_url,
                     headers=headers,
+                    allow_redirects=False,
                     timeout=30
                 )
                 
@@ -263,6 +272,7 @@ class SpeechExtractor:
                     headers=headers,
                     files=files,
                     data=data,
+                    allow_redirects=False,
                     timeout=120
                 )
             
@@ -391,9 +401,11 @@ class SpeechExtractor:
                 continue
             
             result = extract_fn(video_path, api_key, language)
+            if result.get('error'):
+                result['error'] = str(result['error']).replace(api_key, '[REDACTED]')
             
             if result["success"]:
-                result["key_used"] = api_key[:8] + "..."
+                result["key_used"] = 'sha256:' + hashlib.sha256(api_key.encode()).hexdigest()[:8]
                 return result
             
             last_error = result.get("error", "未知错误")

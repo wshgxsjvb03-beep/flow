@@ -71,16 +71,21 @@ function sendMessageToBackground(payload, maxRetries = 5, initialDelay = 500) {
 // 1. 监听来自 MAIN 网页环境的 window.postMessage 消息
 window.addEventListener("message", (event) => {
   // 安全校验：只处理当前 window 发送、且指定 sender 为 "flow-main" 的消息
-  if (event.source !== window || !event.data || event.data.sender !== "flow-main") {
+  if (event.source !== window || event.origin !== location.origin ||
+      location.protocol !== 'https:' || !event.data || event.data.sender !== "flow-main") {
     return;
   }
 
   const { callbackId, payload } = event.data;
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload) ||
+      !['getBgVersion', 'setActiveTask', 'clearActiveTask', 'download', 'getDownloadStatus',
+        'getStorage', 'setStorage', 'nativeFileDrag', 'closeBrowser'].includes(payload.action) ||
+      typeof callbackId !== 'string' || callbackId.length > 128) return;
   console.log(`[FlowIsolated] 收到主页面 postMessage: action=${payload?.action}`);
 
   // 2. 将消息使用重试机制透传给插件后台 Service Worker
   sendMessageToBackground(payload).then((safeResponse) => {
-    console.log(`[FlowIsolated] 收到后台响应并转发回主页面: action=${payload?.action}, response=`, safeResponse);
+    console.log(`[FlowIsolated] 后台响应: action=${payload?.action}`);
     // 3. 将后台返回的结果通过 postMessage 转发回 MAIN 网页环境
     window.postMessage({
       sender: "flow-isolated",

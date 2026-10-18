@@ -2,7 +2,7 @@
 
 > 本文件由 AI 助手自动生成，旨在帮助了解项目的协议合规情况。
 > 本文件为合规参考，不构成法律建议。如有疑问请咨询法律专业人士。
-> 生成时间：2026-07-10
+> 更新时间：2026-10-18
 > 审计工具：AI 依赖协议审计 (https://tpscsm-docs.pages.dev/license-audit/)
 
 ## 项目协议
@@ -15,7 +15,7 @@ GPL-3.0-only (SPDX: GPL-3.0-only)
 
 ### ✅ 合规 — 可开源分发
 
-项目协议 `GPL-3.0-only` 与所有 5 个直接依赖的协议兼容，满足开源分发要求。
+项目协议 `GPL-3.0-only` 与 `LICENSE.LIST` 所列 8 个直接依赖的协议兼容；分发前需落实各许可证的具体义务。
 
 分发时须满足以下义务：
 - **GPL-3.0-only 继承限制**：整个项目及其衍生作品在分发时必须在 GPL-3.0-only 协议下完整开源其源代码。
@@ -27,3 +27,5 @@ GPL-3.0-only (SPDX: GPL-3.0-only)
     - `requests` (Apache-2.0)
     - `pillow` (HPND)
     - `PyQt6` (GPL-3.0-only)
+    - `urllib3`、`soupsieve` (MIT)
+    - `PyQt6-Qt6` (LGPL-3.0-only)：保留 Qt 模块及其第三方许可声明，履行 LGPL 的源码提供、动态库替换等适用义务。

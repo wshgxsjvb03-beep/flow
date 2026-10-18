@@ -44,30 +44,17 @@ class VideoChecker:
         if not search_dir or not search_dir.exists() or not search_dir.is_dir():
             return []
 
-        idx_prefix = f"{index:02d}_"
         matched = []
+        expected_names = {project_id.casefold(), project_id.removesuffix('-flow').casefold()}
 
         try:
             for entry in search_dir.iterdir():
-                if entry.is_dir():
+                if (entry.is_dir() and entry.resolve().parent == search_dir.resolve()
+                        and entry.resolve().name == entry.name):
                     name_lower = entry.name.lower()
-                    pid_lower = project_id.lower()
-                    
-                    # 1. Exact match on project_id or project_id without suffix
-                    if name_lower == pid_lower or name_lower == pid_lower.replace("-flow", ""):
+                    # Prefix/substring matches can select another project's files.
+                    if name_lower in expected_names:
                         matched.append(entry)
-                        continue
-                        
-                    # 2. Match index prefix (e.g. "02_") and col1_name
-                    if entry.name.startswith(idx_prefix):
-                        if not col1_name or col1_name.lower() in name_lower:
-                            matched.append(entry)
-                            continue
-                            
-                    # 3. Match folder containing full project_id string
-                    if pid_lower in name_lower or pid_lower.replace("-flow", "") in name_lower:
-                        matched.append(entry)
-                        continue
         except Exception as e:
             print(f"Error finding project folders in {search_dir}: {e}")
 

@@ -4,12 +4,17 @@
 // @version      1.1
 // @description  Flow 桌面端无缝浏览器自动化适配器 (支持积分回传、Base64图片自动上传、Prompt自动填充)
 // @author       Flow Team
-// @match        *://*/*
+// @match        https://flow.google.com/*
+// @match        https://labs.google/*
+// @match        https://docs.google.com/videos/*
 // @grant        none
 // ==UserScript==
 
 (function () {
     'use strict';
+    if (window.top !== window || location.protocol !== 'https:' ||
+        !['flow.google.com', 'labs.google', 'docs.google.com'].includes(location.hostname) ||
+        (location.hostname === 'docs.google.com' && !location.pathname.startsWith('/videos/'))) return;
 
     const WS_URL = "ws://127.0.0.1:18188";
     let socket = null;

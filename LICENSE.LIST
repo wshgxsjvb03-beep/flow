@@ -1,7 +1,7 @@
 # 依赖协议清单 (LICENSE.LIST)
 
 > 本文件由 AI 助手自动生成，记录项目所有直接依赖的协议信息。
-> 生成时间：2026-07-10
+> 更新时间：2026-10-18
 > 审计工具：AI 依赖协议审计 (https://tpscsm-docs.pages.dev/license-audit/)
 
 ## 统计摘要
@@ -12,8 +12,9 @@
 | HPND | 1 | ✅ 低风险 |
 | Apache-2.0 | 1 | ✅ 低风险 |
 | GPL-3.0 | 1 | ✅ 低风险 (与项目协议兼容) |
+| LGPL-3.0 | 1 | ⚠️ 需关注分发义务 (与项目协议兼容) |
 
-**总计：** 7 个直接依赖
+**总计：** 8 个直接依赖；新增条目是原有 PyQt6 的 Qt 运行时安全下限，未引入新的运行时组件。
 
 ## 依赖详情
 
@@ -26,4 +27,5 @@
 | 5 | pillow | 12.3.0 | HPND | https://pypi.org/project/pillow/ | ✅ | HPND (Historical Permission Notice and Disclaimer) 宽松协议，与 GPL-3.0-only 兼容 |
 | 6 | urllib3 | >=2.8.0 | MIT | https://pypi.org/project/urllib3/ | ✅ | 宽松开源协议，修复 HTTPResponse 内存与 TLS 覆盖漏洞 |
 | 7 | soupsieve | >=2.9.0 | MIT | https://pypi.org/project/soupsieve/ | ✅ | 宽松开源协议，修复 ReDoS 漏洞 |
+| 8 | PyQt6-Qt6 | >=6.11.2,<6.12 | LGPL-3.0-only | https://pypi.org/project/PyQt6-Qt6/ | ⚠️ | Qt 运行时补丁下限；保留 Qt 各模块第三方声明与动态库替换权利；GPL-3.0-only 开源分发兼容 |
 

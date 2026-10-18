@@ -2,6 +2,7 @@
 import os
 import json
 from pathlib import Path
+from services.project_prompts import ProjectPromptStore
 
 class ProjectModel:
     """Manages the metadata for a single project (metadata.json)."""
@@ -11,6 +12,7 @@ class ProjectModel:
     def __init__(self, project_dir):
         self.project_dir = Path(project_dir)
         self.metadata_path = self.project_dir / self.METADATA_FILE_NAME
+        self.prompt_store = ProjectPromptStore(self.project_dir)
         
         # Default empty fields
         self.project_id = self.project_dir.name
@@ -36,7 +38,11 @@ class ProjectModel:
             try:
                 with open(self.metadata_path, "r", encoding="utf-8") as f:
                     data = json.load(f)
-                    self.project_id = data.get("project_id", self.project_id)
+                    project_id = data.get("project_id", self.project_id)
+                    if (isinstance(project_id, str) and project_id not in ('', '.', '..')
+                            and not any(c in project_id for c in '/\\:')
+                            and not any(ord(c) < 32 for c in project_id)):
+                        self.project_id = project_id
                     self.index = data.get("index", self.index)
                     self.col1_name = data.get("col1_name", self.col1_name)
                     self.col7_notes = data.get("col7_notes", self.col7_notes)

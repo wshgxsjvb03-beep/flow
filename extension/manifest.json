@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
-  "name": "FlowCue 插件",
-  "version": "1.0.3",
-  "description": "针对 Google Labs Flow 与 Google Vids 平台的批量视频生成、自动化状态监测与原生拖拽上传工具 (FlowCue 配套扩展)。",
+  "name": "Flow 插件",
+  "version": "1.0.11",
+  "description": "针对 Google Labs Flow 与 Google Vids 平台的批量视频生成、自动化状态监测与原生拖拽上传工具 (Flow 配套扩展)。",
   "permissions": [
     "storage",
     "downloads",
@@ -12,7 +12,7 @@
   "host_permissions": [
     "https://flow.google.com/*",
     "https://labs.google/*",
-    "https://docs.google.com/*",
+    "https://docs.google.com/videos/*",
     "https://*.usercontent.google.com/*",
     "https://*.googleusercontent.com/*",
     "https://*.googleapis.com/*",
@@ -26,25 +26,25 @@
   "content_scripts": [
     {
       "matches": [
-        "*://flow.google.com/*",
-        "*://*.flow.google.com/*",
-        "*://labs.google/*",
-        "*://*.labs.google/*",
-        "*://docs.google.com/videos/*"
+        "https://flow.google.com/*",
+        "https://*.flow.google.com/*",
+        "https://labs.google/*",
+        "https://*.labs.google/*",
+        "https://docs.google.com/videos/*"
       ],
       "css": [
         "injects/ui.css"
       ],
       "run_at": "document_start",
-      "all_frames": true
+      "all_frames": false
     },
     {
       "matches": [
-        "*://flow.google.com/*",
-        "*://*.flow.google.com/*",
-        "*://labs.google/*",
-        "*://*.labs.google/*",
-        "*://docs.google.com/videos/*"
+        "https://flow.google.com/*",
+        "https://*.flow.google.com/*",
+        "https://labs.google/*",
+        "https://*.labs.google/*",
+        "https://docs.google.com/videos/*"
       ],
       "js": [
         "injects/flow-proxy.js",
@@ -52,25 +52,25 @@
       ],
       "run_at": "document_start",
       "world": "MAIN",
-      "all_frames": true
+      "all_frames": false
     },
     {
       "matches": [
-        "*://flow.google.com/*",
-        "*://*.flow.google.com/*",
-        "*://labs.google/*",
-        "*://*.labs.google/*",
-        "*://docs.google.com/videos/*"
+        "https://flow.google.com/*",
+        "https://*.flow.google.com/*",
+        "https://labs.google/*",
+        "https://*.labs.google/*",
+        "https://docs.google.com/videos/*"
       ],
       "js": [
         "content-isolated.js"
       ],
       "run_at": "document_end",
       "world": "ISOLATED",
-      "all_frames": true
+      "all_frames": false
     }
   ],
   "action": {
-    "default_title": "FlowCue 插件 (Flow & Vids)"
+    "default_title": "Flow 插件 (Flow & Vids)"
   }
 }
